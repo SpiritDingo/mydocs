@@ -54,7 +54,7 @@ spec:
 
 ### 🛠 Пример CI-пайплайна (GitLab CI)
 
-
+```YAML
 stages:
   - build
   - test
@@ -86,7 +86,7 @@ push:
     - docker push yourrepo/app:latest
   only:
     - main
-
+```
 
 ⚡ Использует:
 - BuildKit для кэширования и ускорения сборки  

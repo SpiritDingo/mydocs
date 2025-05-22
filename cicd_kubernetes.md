@@ -2,7 +2,7 @@
 
  ☸️ Пример манифеста для Kubernetes
 
-
+```
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -46,7 +46,7 @@ spec:
             port: 8080
           initialDelaySeconds: 5
           periodSeconds: 10
-
+```
 
 🛡 Безопасность, ограничение ресурсов, probes — всё в боевом шаблоне.
 

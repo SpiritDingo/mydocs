@@ -178,3 +178,128 @@ ansible-playbook -i inventory.ini migrate_to_nexus.yml
 6. **Без CE-сертификата** - отключена проверка SSL (`sslverify=0` для Oracle, аналогично для Ubuntu).
 
 Роль поддерживает как Oracle Linux 9, так и Ubuntu, автоматически определяя ОС и применяя соответствующие настройки.
+
+
+Ошибка "Failed to download metadata for repo" указывает на проблему с доступом к репозиторию Nexus. Давайте исправим роль для корректной работы.
+
+## Причины и решения проблемы
+
+1. **Неправильный URL репозитория**
+2. **Проблемы с SSL (вы используете sslverify=0, но возможно нужны другие настройки)**
+3. **Неверный путь к репозиторию в Nexus**
+4. **Отсутствие аутентификации, если она требуется**
+
+## Обновленная роль
+
+### Исправленный файл templates/oracle_nexus.repo.j2
+
+```ini
+[{{ oracle_repo_name }}]
+name=Nexus Repository for Oracle Linux 9
+baseurl={{ nexus_url }}{{ nexus_oracle_repo_path }}/$releasever/$basearch/
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-oracle
+sslverify=0
+metadata_expire=300
+skip_if_unavailable=True
+```
+
+### Обновленный tasks/oracle_linux.yml
+
+```yaml
+---
+- name: Проверка доступности Nexus репозитория
+  uri:
+    url: "{{ nexus_url }}{{ nexus_oracle_repo_path }}/repodata/repomd.xml"
+    validate_certs: no
+    return_content: yes
+  register: nexus_check
+  ignore_errors: yes
+
+- name: Отладка - вывод результата проверки Nexus
+  debug:
+    var: nexus_check
+
+- name: Удаление старых репозиториев Oracle Linux
+  file:
+    path: "/etc/yum.repos.d/{{ item }}"
+    state: absent
+  loop:
+    - "oracle-linux-ol9.repo"
+    - "spacewalk.repo"
+
+- name: Создание backup оригинальных репозиториев
+  copy:
+    src: "/etc/yum.repos.d/"
+    dest: "/etc/yum.repos.d.backup_{{ ansible_date_time.date }}"
+    remote_src: yes
+  when: not nexus_check.failed
+
+- name: Копирование конфигурации репозитория Nexus для Oracle Linux
+  template:
+    src: "oracle_nexus.repo.j2"
+    dest: "/etc/yum.repos.d/{{ oracle_repo_name }}.repo"
+    owner: root
+    group: root
+    mode: '0644'
+  when: not nexus_check.failed
+
+- name: Очистка кеша yum
+  yum:
+    clean_all: yes
+  when: not nexus_check.failed
+
+- name: Обновление индексов репозиториев
+  yum:
+    update_cache: yes
+  when: not nexus_check.failed
+
+- name: Fail if Nexus repository is not available
+  fail:
+    msg: "Nexus repository is not available at {{ nexus_url }}{{ nexus_oracle_repo_path }}"
+  when: nexus_check.failed
+```
+
+## Дополнительные проверки
+
+1. **Проверьте URL в Nexus**:
+   - Убедитесь, что `nexus_url` и `nexus_oracle_repo_path` правильно указывают на репозиторий
+   - В Nexus путь обычно выглядит как `/repository/<имя_репозитория>`
+
+2. **Проверьте структуру репозитория**:
+   ```bash
+   curl -k {{ nexus_url }}{{ nexus_oracle_repo_path}}/repodata/repomd.xml
+   ```
+   Должен вернуть XML-файл
+
+3. **Если требуется аутентификация**:
+   ```ini
+   username=<user>
+   password=<password>
+   ```
+
+4. **Проверьте переменные в vars/main.yml**:
+   ```yaml
+   nexus_url: "https://nexus.example.com"
+   nexus_oracle_repo_path: "/repository/ol9"
+   ```
+
+## Альтернативное решение
+
+Если проблема сохраняется, можно попробовать использовать группировку по архитектуре и версии:
+
+```ini
+baseurl={{ nexus_url }}{{ nexus_oracle_repo_path }}/$releasever/$basearch/
+```
+
+Или явно указать версию (для OL9):
+```ini
+baseurl={{ nexus_url }}{{ nexus_oracle_repo_path }}/9/$basearch/
+```
+
+После внесения изменений выполните:
+```bash
+ansible-playbook -i inventory.yml playbook.yml --tags debug
+```
+чтобы увидеть результаты проверки доступности репозитория.

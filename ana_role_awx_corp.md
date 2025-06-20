@@ -844,3 +844,113 @@ docker compose version
 1. Остановить старые контейнеры
 2. Удалить устаревший docker-compose v1
 3. Развернуть новую конфигурацию
+
+
+
+
+Ошибка возникает из-за того, что Ansible не может найти файл шаблона `awx_config.j2`. Давайте исправим эту проблему и улучшим структуру роли.
+
+## Исправленная структура роли
+
+```
+awx_docker_compose/
+├── defaults/
+│   └── main.yml
+├── files/
+│   ├── docker-compose.yml.j2
+│   ├── nginx.conf.j2
+│   └── awx_schedules.json
+├── tasks/
+│   └── main.yml
+└── templates/
+    ├── awx_config.j2          # Перенесён из files/
+    └── custom_environment.j2  # Новый файл
+```
+
+## Решение проблемы
+
+1. **Переносим файлы в правильные директории**:
+   - `.j2` шаблоны должны быть в `templates/`
+   - Статические файлы (не шаблоны) - в `files/`
+
+2. **Обновляем task для работы с шаблонами**:
+
+```yaml
+- name: Deploy custom AWX configuration
+  template:
+    src: awx_config.j2
+    dest: "{{ awx_config_dir }}/custom_environment.conf"
+    mode: 0644
+```
+
+3. **Содержимое `templates/awx_config.j2`**:
+
+```jinja2
+# AWX Custom Configuration
+AWX_ADMIN_USER="{{ awx_admin_user }}"
+AWX_ADMIN_PASSWORD="{{ awx_admin_password }}"
+AWX_SECRET_KEY="{{ awx_secret_key }}"
+
+# Database Configuration
+AWX_POSTGRES_HOST="{{ awx_postgres_host | default('postgres') }}"
+AWX_POSTGRES_PORT="{{ awx_postgres_port | default(5432) }}"
+AWX_POSTGRES_DB="{{ awx_postgres_database }}"
+AWX_POSTGRES_USER="{{ awx_postgres_user }}"
+AWX_POSTGRES_PASSWORD="{{ awx_postgres_password }}"
+
+# Redis Configuration
+AWX_REDIS_HOST="{{ awx_redis_host | default('redis') }}"
+AWX_REDIS_PORT="{{ awx_redis_port | default(6379) }}"
+
+# Additional Settings
+AWX_TASK_WORKERS="{{ awx_task_workers | default(4) }}"
+AWX_ANSIBLE_CALLBACK_PLUGINS="/usr/share/ansible/plugins/callback"
+```
+
+## Полное исправление задачи
+
+Замените проблемный task в `tasks/main.yml` на:
+
+```yaml
+- name: Deploy AWX configuration templates
+  block:
+    - name: Deploy main AWX config
+      template:
+        src: "awx_config.j2"
+        dest: "{{ awx_config_dir }}/custom_environment.conf"
+        mode: 0644
+
+    - name: Deploy Nginx config
+      template:
+        src: "nginx.conf.j2"
+        dest: "{{ awx_config_dir }}/nginx.conf"
+        mode: 0644
+
+    - name: Deploy Docker Compose file
+      template:
+        src: "docker-compose.yml.j2"
+        dest: "{{ awx_config_dir }}/docker-compose.yml"
+        mode: 0644
+```
+
+## Дополнительные проверки
+
+1. Убедитесь, что:
+   - Файл `templates/awx_config.j2` существует
+   - У вас есть права на чтение файлов
+   - Пути в шаблоне указаны правильно
+
+2. Для диагностики можно выполнить:
+
+```bash
+ansible-playbook playbook.yml -vvv  # для подробного вывода
+ls -l roles/awx_docker_compose/templates/  # проверка наличия файлов
+```
+
+3. Если используете custom пути, укажите полный путь:
+
+```yaml
+src: "{{ role_path }}/templates/awx_config.j2"
+```
+
+После этих изменений ошибка "Could not find or access" должна исчезнуть, так как Ansible теперь будет искать шаблоны в правильной директории.

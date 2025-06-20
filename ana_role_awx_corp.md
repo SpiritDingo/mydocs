@@ -443,3 +443,256 @@ AWX_MAX_CONCURRENT_JOBS="{{ awx_max_concurrent_jobs | default(10) }}"
 - **Безопасность** (секреты хранятся в `vars`, а не в шаблонах).
 - **Гибкость** (можно менять конфигурацию AWX без изменения роли).
 - **Масштабируемость** (легко добавлять новые интеграции).
+
+
+
+
+Вот обновлённая Ansible-роль с актуальной конфигурацией Docker Compose для AWX (на основе официального образа `ansible/awx:latest`), включая поддержку последних версий AWX и лучшие практики развертывания.
+
+## Обновлённая структура роли
+
+```
+awx_docker_compose/
+├── defaults/
+│   └── main.yml
+├── files/
+│   ├── docker-compose.yml.j2    # Обновлённый файл
+│   ├── nginx.conf.j2
+│   ├── awx_schedules.json
+│   └── custom_environment.conf  # Для дополнительных переменных AWX
+├── tasks/
+│   └── main.yml
+└── templates/
+    └── awx_config.j2
+```
+
+## Ключевые изменения (v2)
+
+1. **Поддержка AWX 22.0+** (актуальная версия)
+2. **Оптимизированные настройки Redis** (вместо RabbitMQ в новых версиях)
+3. **Поддержка Kubernetes-style переменных** для AWX
+4. **Автоматическое создание volumes** для данных
+5. **Поддержка healthcheck** для контейнеров
+
+## Обновлённые файлы
+
+### `files/docker-compose.yml.j2` (актуальная версия)
+
+```yaml
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: awx_postgres
+    restart: unless-stopped
+    volumes:
+      - "{{ awx_postgres_data_volume }}:/var/lib/postgresql/data"
+    environment:
+      POSTGRES_USER: "{{ awx_postgres_user }}"
+      POSTGRES_PASSWORD: "{{ awx_postgres_password }}"
+      POSTGRES_DB: "{{ awx_postgres_database }}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U {{ awx_postgres_user }}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - awx_network
+
+  redis:
+    image: redis:7
+    container_name: awx_redis
+    restart: unless-stopped
+    command: redis-server --maxmemory 1gb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - awx_network
+
+  awx:
+    image: ansible/awx:latest
+    container_name: awx
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - "{{ awx_projects_volume }}:/var/lib/awx/projects"
+      - "/etc/passwd:/etc/passwd:ro"
+      - "/etc/timezone:/etc/timezone:ro"
+      - "./custom_environment.conf:/etc/tower/conf.d/custom_environment.conf:ro"
+    environment:
+      AWX_ADMIN_USER: "{{ awx_admin_user }}"
+      AWX_ADMIN_PASSWORD: "{{ awx_admin_password }}"
+      AWX_SECRET_KEY: "{{ awx_secret_key }}"
+      AWX_REDIS_HOST: "redis"
+      AWX_REDIS_PORT: 6379
+      AWX_POSTGRES_HOST: "postgres"
+      AWX_POSTGRES_PORT: 5432
+      AWX_POSTGRES_USER: "{{ awx_postgres_user }}"
+      AWX_POSTGRES_PASSWORD: "{{ awx_postgres_password }}"
+      AWX_POSTGRES_DATABASE: "{{ awx_postgres_database }}"
+      AWX_TASK_CONTAINER_MEMORY: "{{ awx_task_memory | default('2g') }}"
+      AWX_WEB_CONTAINER_MEMORY: "{{ awx_web_memory | default('1g') }}"
+    networks:
+      - awx_network
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.awx.rule: "Host(`{{ awx_domain }}`)"
+      traefik.http.routers.awx.entrypoints: "websecure"
+      traefik.http.routers.awx.tls.certresolver: "myresolver"
+
+  awx_nginx:
+    image: nginx:1.25
+    container_name: awx_nginx
+    restart: unless-stopped
+    ports:
+      - "{{ awx_http_port }}:80"
+      - "{{ awx_https_port }}:443"
+    volumes:
+      - "./nginx.conf:/etc/nginx/nginx.conf:ro"
+      - "{{ awx_ssl_cert_path }}:/etc/nginx/ssl/cert.pem:ro"
+      - "{{ awx_ssl_key_path }}:/etc/nginx/ssl/key.pem:ro"
+    depends_on:
+      - awx
+    networks:
+      - awx_network
+
+networks:
+  awx_network:
+    driver: bridge
+
+volumes:
+  awx_postgres_data:
+  awx_projects:
+```
+
+### `files/custom_environment.conf`
+
+```
+# Custom AWX settings
+AWX_ANSIBLE_CALLBACK_PLUGINS=/usr/share/ansible/plugins/callback
+AWX_ANSIBLE_COLLECTIONS_PATHS=/var/lib/awx/vendor/awx_ansible_collections
+AWX_ANSIBLE_INVENTORY_PLUGINS=/usr/share/ansible/plugins/inventory
+```
+
+### `tasks/main.yml` (обновлённый)
+
+```yaml
+- name: Ensure Docker and dependencies are installed
+  apt:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-compose-plugin
+    state: present
+    update_cache: yes
+  when: ansible_os_family == 'Debian'
+
+- name: Create AWX directories
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: 0755
+  loop:
+    - "{{ awx_config_dir }}"
+    - "{{ awx_ssl_dir }}"
+
+- name: Deploy Docker Compose file
+  template:
+    src: files/docker-compose.yml.j2
+    dest: "{{ awx_config_dir }}/docker-compose.yml"
+    mode: 0644
+
+- name: Deploy Nginx configuration
+  template:
+    src: files/nginx.conf.j2
+    dest: "{{ awx_config_dir }}/nginx.conf"
+    mode: 0644
+
+- name: Deploy custom AWX environment
+  template:
+    src: templates/awx_config.j2
+    dest: "{{ awx_config_dir }}/custom_environment.conf"
+    mode: 0644
+
+- name: Start AWX containers
+  community.docker.docker_compose:
+    project_src: "{{ awx_config_dir }}"
+    build: no
+    pull: yes
+    state: present
+    restart: yes
+    recreate: always
+    timeout: 300
+
+- name: Wait for AWX to become ready
+  uri:
+    url: "http://localhost:{{ awx_http_port }}/api/v2/ping/"
+    method: GET
+    status_code: 200
+    timeout: 30
+  register: awx_status
+  until: awx_status.status == 200
+  retries: 30
+  delay: 10
+```
+
+### `defaults/main.yml` (обновлённый)
+
+```yaml
+awx_config_dir: "/opt/awx"
+awx_ssl_dir: "/etc/ssl/awx"
+
+# Docker settings
+awx_postgres_data_volume: "awx_postgres_data"
+awx_projects_volume: "awx_projects"
+
+# AWX settings
+awx_admin_user: "admin"
+awx_admin_password: "changeme"
+awx_secret_key: "your-secret-key-here"
+awx_task_memory: "2g"
+awx_web_memory: "1g"
+
+# Network settings
+awx_http_port: 80
+awx_https_port: 443
+awx_domain: "awx.example.com"
+awx_ssl_cert_path: "{{ awx_ssl_dir }}/fullchain.pem"
+awx_ssl_key_path: "{{ awx_ssl_dir }}/privkey.pem"
+
+# Database settings
+awx_postgres_user: "awx"
+awx_postgres_password: "awxpass"
+awx_postgres_database: "awx"
+```
+
+## Новые возможности
+
+1. **Поддержка Traefik** (в дополнение к Nginx)
+2. **Автоматическое обновление контейнеров** (`pull: yes`)
+3. **Health checks** для Postgres и Redis
+4. **Оптимизация памяти** для задач AWX
+5. **Поддержка современных версий**:
+   - PostgreSQL 15
+   - Redis 7
+   - Nginx 1.25
+   - Docker Compose 3.8
+
+## Развёртывание
+
+```bash
+ansible-playbook -i inventory.yml awx_deploy.yml \
+  -e "awx_admin_password=MySecurePass123" \
+  -e "awx_domain=awx.mycompany.com"
+```
+
+Эта конфигурация соответствует лучшим практикам 2024 года и поддерживает все актуальные функции AWX.

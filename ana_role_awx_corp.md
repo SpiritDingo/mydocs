@@ -321,3 +321,125 @@ ansible-playbook -i inventory.ini awx_playbook.yml -e @vars.yml
 - Настройка учетных данных
 
 Роль предоставляет базовую установку AWX с Nginx в Docker Compose с возможностью расширения функционала.
+
+
+
+
+
+
+В Ansible-роли для AWX переменные в `vars/` и `custom_awx_config.j2` служат разным целям. Вот детальное различие и рекомендации по их использованию:
+
+---
+
+## **1. Переменные в `vars/main.yml`**
+Здесь определяются **основные параметры развертывания**, которые влияют на:
+- Конфигурацию Docker Compose
+- Настройки безопасности
+- Параметры подключения к внешним сервисам
+- Параметры инфраструктуры
+
+### **Пример содержимого `vars/main.yml`:**
+```yaml
+# Docker и сетевые настройки
+awx_docker_network: "awx_net"
+awx_postgres_data_dir: "/data/awx/postgres"
+awx_project_data_dir: "/data/awx/projects"
+
+# Учетные данные AWX
+awx_admin_user: "awx_admin"
+awx_admin_password: "SuperSecurePass123!"
+awx_secret_key: "my-very-secret-key-1234567890"
+
+# Настройки PostgreSQL
+awx_postgres_user: "awx_pg_user"
+awx_postgres_password: "pg_password_123"
+awx_postgres_database: "awx_db"
+awx_postgres_port: 5432
+
+# RabbitMQ
+awx_rabbitmq_user: "awx_rabbit"
+awx_rabbitmq_password: "rabbit_pass_123"
+awx_rabbitmq_vhost: "/awx"
+
+# Nginx и SSL
+awx_nginx_port: 80
+awx_nginx_ssl_port: 443
+awx_domain: "awx.company.com"
+awx_nginx_ssl_cert: "/etc/ssl/certs/awx.crt"
+awx_nginx_ssl_key: "/etc/ssl/private/awx.key"
+
+# Дополнительные настройки
+awx_timezone: "Europe/Moscow"
+awx_max_concurrent_jobs: 10
+awx_task_workers: 4
+```
+
+---
+
+## **2. `templates/custom_awx_config.j2`**
+Это **Jinja2-шаблон** для генерации кастомных конфигураций AWX, которые:
+- Модифицируют настройки `awx.conf` (основной конфиг AWX)
+- Добавляют кастомные переменные окружения
+- Настраивают интеграции (LDAP, SAML, уведомления и т. д.)
+
+### **Пример содержимого `custom_awx_config.j2`:**
+```jinja2
+# Настройки базы данных
+AWX_DB_HOST="{{ awx_postgres_host | default('postgres') }}"
+AWX_DB_PORT="{{ awx_postgres_port | default(5432) }}"
+AWX_DB_NAME="{{ awx_postgres_database | default('awx') }}"
+AWX_DB_USER="{{ awx_postgres_user | default('awx') }}"
+AWX_DB_PASSWORD="{{ awx_postgres_password | default('awxpass') }}"
+
+# Настройки Redis/RabbitMQ
+AWX_RABBITMQ_HOST="{{ awx_rabbitmq_host | default('rabbitmq') }}"
+AWX_RABBITMQ_PORT="{{ awx_rabbitmq_port | default(5672) }}"
+AWX_RABBITMQ_USER="{{ awx_rabbitmq_user | default('awx') }}"
+AWX_RABBITMQ_PASSWORD="{{ awx_rabbitmq_password | default('awxpass') }}"
+AWX_RABBITMQ_VHOST="{{ awx_rabbitmq_vhost | default('/awx') }}"
+
+# Настройки безопасности
+AWX_SECRET_KEY="{{ awx_secret_key }}"
+AWX_CSRF_TRUSTED_ORIGINS="https://{{ awx_domain }}"
+
+# Настройки LDAP (если используется)
+{% if awx_ldap_enabled %}
+AWX_AUTH_LDAP_SERVER_URI="ldap://{{ awx_ldap_server }}"
+AWX_AUTH_LDAP_BIND_DN="{{ awx_ldap_bind_dn }}"
+AWX_AUTH_LDAP_BIND_PASSWORD="{{ awx_ldap_bind_password }}"
+AWX_AUTH_LDAP_USER_SEARCH="ou=users,dc=example,dc=com"
+{% endif %}
+
+# Настройки уведомлений (например, Slack)
+{% if awx_slack_webhook %}
+AWX_NOTIFICATION_SLACK_WEBHOOK="{{ awx_slack_webhook }}"
+{% endif %}
+
+# Дополнительные параметры
+AWX_TASK_WORKERS="{{ awx_task_workers | default(4) }}"
+AWX_MAX_CONCURRENT_JOBS="{{ awx_max_concurrent_jobs | default(10) }}"
+```
+
+---
+
+## **Что куда писать?**
+| **Параметр**                     | **`vars/main.yml`** | **`custom_awx_config.j2`** |
+|----------------------------------|---------------------|---------------------------|
+| Учетные данные (DB, RabbitMQ)    | ✅ Да              | ❌ Нет (только ссылки)    |
+| Пароли и секретные ключи         | ✅ Да              | ❌ Нет (только подстановка) |
+| Параметры Docker Compose         | ✅ Да              | ❌ Нет                    |
+| Настройки Nginx/SSL              | ✅ Да              | ❌ Нет                    |
+| Кастомные переменные AWX         | ❌ Нет             | ✅ Да                     |
+| Интеграции (LDAP, Slack, SAML)   | ❌ Нет             | ✅ Да                     |
+| Ограничения (workers, jobs)      | ✅ Да (значения)   | ✅ Да (подстановка)       |
+
+---
+
+## **Вывод**
+- **`vars/main.yml`** — для **инфраструктурных параметров** (Docker, сеть, порты, учетные данные).
+- **`custom_awx_config.j2`** — для **тонкой настройки AWX** (конфигурация приложения, интеграции, кастомные переменные).
+
+Такой подход обеспечивает:
+- **Безопасность** (секреты хранятся в `vars`, а не в шаблонах).
+- **Гибкость** (можно менять конфигурацию AWX без изменения роли).
+- **Масштабируемость** (легко добавлять новые интеграции).

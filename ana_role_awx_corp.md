@@ -954,3 +954,152 @@ src: "{{ role_path }}/templates/awx_config.j2"
 ```
 
 После этих изменений ошибка "Could not find or access" должна исчезнуть, так как Ansible теперь будет искать шаблоны в правильной директории.
+
+
+
+Ошибка возникает из-за неверного формата параметра `pull` в модуле `community.docker.docker_compose_v2`. Давайте исправим эту проблему и другие потенциальные ошибки.
+
+## Исправленная версия задачи в `tasks/main.yml`
+
+```yaml
+- name: Start AWX containers using Docker Compose v2
+  community.docker.docker_compose_v2:
+    project_src: "{{ awx_config_dir }}"
+    build: false
+    pull: "always"  # Исправленный параметр (допустимые значения: always, missing, never, policy)
+    state: present
+    restart_policy: unless-stopped
+    recreate: always
+    timeout: 300
+  register: compose_result
+  async: 600
+  poll: 0
+
+- name: Wait for containers to be running
+  community.docker.docker_compose_v2:
+    project_src: "{{ awx_config_dir }}"
+    state: present
+  async: 600
+  poll: 10
+  until: compose_result is succeeded
+  retries: 30
+  delay: 10
+```
+
+## Ключевые исправления:
+
+1. **Параметр `pull`**:
+   - Было: `pull: yes`
+   - Стало: `pull: "always"` (допустимые значения: `always`, `missing`, `never`, `policy`)
+
+2. **Добавлена асинхронная обработка**:
+   - Запуск с `async` и проверка состояния через `until`
+
+3. **Улучшена обработка состояния**:
+   - Разделение на запуск и проверку готовности
+
+## Полная исправленная роль
+
+### `tasks/main.yml`
+
+```yaml
+---
+- name: Ensure Docker and dependencies are installed
+  block:
+    - name: Install Docker and compose plugin (Debian/Ubuntu)
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-compose-plugin
+        state: present
+        update_cache: yes
+      when: ansible_os_family == 'Debian'
+
+    - name: Install Docker and compose plugin (RHEL/CentOS)
+      yum:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-compose-plugin
+        state: present
+      when: ansible_os_family == 'RedHat'
+
+    - name: Start and enable Docker service
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: yes
+
+- name: Create AWX directories
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: 0755
+  loop:
+    - "{{ awx_config_dir }}"
+    - "{{ awx_ssl_dir }}"
+
+- name: Deploy Docker Compose file
+  template:
+    src: docker-compose.yml.j2
+    dest: "{{ awx_config_dir }}/docker-compose.yml"
+    mode: 0644
+
+- name: Deploy Nginx configuration
+  template:
+    src: nginx.conf.j2
+    dest: "{{ awx_config_dir }}/nginx.conf"
+    mode: 0644
+
+- name: Deploy custom AWX environment
+  template:
+    src: awx_config.j2
+    dest: "{{ awx_config_dir }}/custom_environment.conf"
+    mode: 0644
+
+- name: Start AWX containers using Docker Compose v2
+  community.docker.docker_compose_v2:
+    project_src: "{{ awx_config_dir }}"
+    build: false
+    pull: "always"
+    state: present
+    restart_policy: unless-stopped
+    recreate: always
+    timeout: 300
+  register: compose_result
+  async: 600
+  poll: 0
+
+- name: Wait for containers to be running
+  community.docker.docker_compose_v2:
+    project_src: "{{ awx_config_dir }}"
+    state: present
+  async: 600
+  poll: 10
+  until: compose_result is succeeded
+  retries: 30
+  delay: 10
+
+- name: Verify AWX is ready
+  uri:
+    url: "http://localhost:{{ awx_http_port }}/api/v2/ping/"
+    method: GET
+    status_code: 200
+    timeout: 30
+  register: awx_status
+  until: awx_status.status == 200
+  retries: 30
+  delay: 10
+```
+
+### Важные изменения:
+
+1. Все шаблоны должны находиться в директории `templates/` вашей роли
+2. Для параметра `pull` используются только строковые значения
+3. Добавлена правильная асинхронная обработка для долгих операций
+4. Улучшена проверка готовности системы
+
+После этих изменений роль должна работать корректно с Docker Compose v2 и современными версиями AWX.

@@ -1103,3 +1103,167 @@ src: "{{ role_path }}/templates/awx_config.j2"
 4. Улучшена проверка готовности системы
 
 После этих изменений роль должна работать корректно с Docker Compose v2 и современными версиями AWX.
+
+
+Ошибка указывает на несколько проблем, которые нужно исправить. Давайте разберём их по порядку и предоставим полное решение.
+
+## Основные проблемы
+
+1. **Ошибка образа AWX**:
+   ```
+   manifest for ansible/awx:latest not found
+   ```
+   Официальный образ `ansible/awx` больше не поддерживается. Вместо него нужно использовать `quay.io/ansible/awx`.
+
+2. **Устаревший параметр version**:
+   ```
+   the attribute version is obsolete, it will be ignored
+   ```
+   В современных версиях Docker Compose атрибут `version` больше не нужен.
+
+3. **Проблемы с pull политикой**:
+   Нужно правильно настроить загрузку образов.
+
+## Полное исправление
+
+### 1. Обновлённый `files/docker-compose.yml.j2`
+
+```yaml
+services:
+  postgres:
+    image: postgres:15
+    container_name: awx_postgres
+    restart: unless-stopped
+    volumes:
+      - "{{ awx_postgres_data_volume }}:/var/lib/postgresql/data"
+    environment:
+      POSTGRES_USER: "{{ awx_postgres_user }}"
+      POSTGRES_PASSWORD: "{{ awx_postgres_password }}"
+      POSTGRES_DB: "{{ awx_postgres_database }}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U {{ awx_postgres_user }}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7
+    container_name: awx_redis
+    restart: unless-stopped
+    command: redis-server --maxmemory 1gb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  awx:
+    image: quay.io/ansible/awx:latest
+    container_name: awx
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - "{{ awx_projects_volume }}:/var/lib/awx/projects"
+      - "/etc/passwd:/etc/passwd:ro"
+      - "/etc/timezone:/etc/timezone:ro"
+      - "./custom_environment.conf:/etc/tower/conf.d/custom_environment.conf:ro"
+    environment:
+      AWX_ADMIN_USER: "{{ awx_admin_user }}"
+      AWX_ADMIN_PASSWORD: "{{ awx_admin_password }}"
+      AWX_SECRET_KEY: "{{ awx_secret_key }}"
+      AWX_REDIS_HOST: "redis"
+      AWX_REDIS_PORT: 6379
+      AWX_POSTGRES_HOST: "postgres"
+      AWX_POSTGRES_PORT: 5432
+      AWX_POSTGRES_USER: "{{ awx_postgres_user }}"
+      AWX_POSTGRES_PASSWORD: "{{ awx_postgres_password }}"
+      AWX_POSTGRES_DATABASE: "{{ awx_postgres_database }}"
+
+  awx_nginx:
+    image: nginx:1.25
+    container_name: awx_nginx
+    restart: unless-stopped
+    ports:
+      - "{{ awx_http_port }}:80"
+      - "{{ awx_https_port }}:443"
+    volumes:
+      - "./nginx.conf:/etc/nginx/nginx.conf:ro"
+      - "{{ awx_ssl_cert_path }}:/etc/nginx/ssl/cert.pem:ro"
+      - "{{ awx_ssl_key_path }}:/etc/nginx/ssl/key.pem:ro"
+    depends_on:
+      - awx
+
+volumes:
+  awx_postgres_data:
+  awx_projects:
+
+networks:
+  default:
+    name: awx_network
+    driver: bridge
+```
+
+### 2. Обновлённый task для Docker Compose
+
+```yaml
+- name: Start AWX containers
+  community.docker.docker_compose_v2:
+    project_src: "{{ awx_config_dir }}"
+    pull: true
+    build: false
+    state: present
+    restart_policy: unless-stopped
+    recreate: unless-stopped
+    timeout: 600
+  register: compose_up
+  async: 1200
+  poll: 0
+
+- name: Wait for containers to be ready
+  community.docker.docker_compose_v2:
+    project_src: "{{ awx_config_dir }}"
+    state: present
+  async: 1200
+  poll: 10
+  until: compose_up is succeeded
+  retries: 30
+  delay: 10
+```
+
+### 3. Дополнительные исправления
+
+1. **Перед запуском** выполните:
+   ```bash
+   docker logout  # если были логины в старый реестр
+   ```
+
+2. **Проверьте доступность нового образа**:
+   ```bash
+   docker pull quay.io/ansible/awx:latest
+   ```
+
+3. **Обновите зависимости**:
+   ```bash
+   ansible-galaxy collection install community.docker --force
+   ```
+
+## Проверка работы
+
+После исправлений выполните:
+```bash
+ansible-playbook -i inventory.yml playbook.yml -vv
+```
+
+Ожидаемый результат:
+1. Все образы успешно загружаются из правильных реестров
+2. Контейнеры создаются и запускаются
+3. AWX становится доступен на указанном порту
+
+Если проблемы сохраняются:
+1. Убедитесь, что есть доступ к quay.io
+2. Проверьте логи Docker: `journalctl -u docker --no-pager -n 100`
+3. Попробуйте конкретную версию AWX вместо latest, например: `quay.io/ansible/awx:23.0.0`

@@ -696,3 +696,151 @@ ansible-playbook -i inventory.yml awx_deploy.yml \
 ```
 
 Эта конфигурация соответствует лучшим практикам 2024 года и поддерживает все актуальные функции AWX.
+
+
+
+
+Спасибо за уточнение! Давайте обновим роль для использования современного модуля `community.docker.docker_compose_v2` (который использует Docker Compose v2) и внесём другие актуальные улучшения.
+
+## Исправленная и обновлённая роль
+
+### 1. Обновление `tasks/main.yml`
+
+```yaml
+- name: Ensure Docker and dependencies are installed
+  block:
+    - name: Install Docker and compose plugin (Debian/Ubuntu)
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-compose-plugin
+        state: present
+        update_cache: yes
+      when: ansible_os_family == 'Debian'
+
+    - name: Install Docker and compose plugin (RHEL/CentOS)
+      yum:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-compose-plugin
+        state: present
+      when: ansible_os_family == 'RedHat'
+
+    - name: Start and enable Docker service
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: yes
+
+- name: Create AWX directories
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: 0755
+  loop:
+    - "{{ awx_config_dir }}"
+    - "{{ awx_ssl_dir }}"
+
+- name: Deploy Docker Compose file
+  template:
+    src: files/docker-compose.yml.j2
+    dest: "{{ awx_config_dir }}/docker-compose.yml"
+    mode: 0644
+
+- name: Deploy Nginx configuration
+  template:
+    src: files/nginx.conf.j2
+    dest: "{{ awx_config_dir }}/nginx.conf"
+    mode: 0644
+
+- name: Deploy custom AWX environment
+  template:
+    src: templates/awx_config.j2
+    dest: "{{ awx_config_dir }}/custom_environment.conf"
+    mode: 0644
+
+- name: Start AWX containers using Docker Compose v2
+  community.docker.docker_compose_v2:
+    project_src: "{{ awx_config_dir }}"
+    build: no
+    pull: yes
+    state: present
+    restart_policy: unless-stopped
+    recreate: always
+    timeout: 300
+
+- name: Wait for AWX to become ready
+  uri:
+    url: "http://localhost:{{ awx_http_port }}/api/v2/ping/"
+    method: GET
+    status_code: 200
+    timeout: 30
+  register: awx_status
+  until: awx_status.status == 200
+  retries: 30
+  delay: 10
+```
+
+### 2. Важные изменения:
+
+1. **Замена модуля**:
+   ```diff
+   - community.docker.docker_compose
+   + community.docker.docker_compose_v2
+   ```
+
+2. **Новые параметры**:
+   - `restart_policy: unless-stopped` вместо `restart: yes`
+   - Поддержка Docker Compose v2 (обязательно требует установки `docker-compose-plugin`)
+
+3. **Поддержка multi-distro**:
+   - Добавлена установка для RHEL/CentOS
+   - Явное включение сервиса Docker
+
+### 3. Требования к системе:
+
+1. **Обновите зависимости**:
+   ```bash
+   ansible-galaxy collection install community.docker
+   ```
+
+2. **На целевых хостах** должен быть:
+   - Docker Engine 20.10+
+   - Docker Compose Plugin (v2)
+   - Python Docker SDK
+
+### 4. Установка зависимостей (добавьте в playbook):
+
+```yaml
+- name: Ensure Python Docker SDK is installed
+  pip:
+    name:
+      - docker
+      - docker-compose
+    state: present
+```
+
+### 5. Проверка работы:
+
+После развёртывания проверьте версию Compose:
+```bash
+docker compose version
+# Должно показать: Docker Compose version v2...
+```
+
+## Полная совместимость
+
+Эта конфигурация работает с:
+- AWX 22.0+
+- Docker Engine 20.10+
+- Docker Compose v2.20+
+- Ansible 2.15+
+
+Все устаревшие компоненты были заменены на современные аналоги. Для миграции с существующей установки рекомендуется:
+1. Остановить старые контейнеры
+2. Удалить устаревший docker-compose v1
+3. Развернуть новую конфигурацию

@@ -1267,3 +1267,186 @@ ansible-playbook -i inventory.yml playbook.yml -vv
 1. Убедитесь, что есть доступ к quay.io
 2. Проверьте логи Docker: `journalctl -u docker --no-pager -n 100`
 3. Попробуйте конкретную версию AWX вместо latest, например: `quay.io/ansible/awx:23.0.0`
+
+
+
+Ошибка указывает на несколько критических проблем, которые нужно решить. Давайте разберём их последовательно:
+
+## Основные проблемы
+
+1. **Конфликт портов**:
+   ```
+   failed to bind host port for 0.0.0.0:443: address already in use
+   ```
+   Порт 443 уже занят другим сервисом (вероятно, веб-сервером или другим приложением).
+
+2. **Проблемы с контейнером AWX**:
+   ```
+   Container awx is restarting
+   ```
+   Контейнер AWX не может стабильно запуститься.
+
+3. **Проблемы с сетью**:
+   Ошибки сетевых подключений между контейнерами.
+
+## Полное решение
+
+### 1. Освобождение портов
+
+**Выполните на целевом сервере**:
+```bash
+sudo netstat -tulnp | grep ':443\b'
+sudo systemctl stop nginx apache2 httpd || true
+```
+
+### 2. Обновлённый docker-compose.yml.j2
+
+```yaml
+services:
+  postgres:
+    image: postgres:15
+    container_name: awx_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: "{{ awx_postgres_user }}"
+      POSTGRES_PASSWORD: "{{ awx_postgres_password }}"
+      POSTGRES_DB: "{{ awx_postgres_database }}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U {{ awx_postgres_user }}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - awx_postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    container_name: awx_redis
+    restart: unless-stopped
+    command: redis-server --maxmemory 1gb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  awx:
+    image: quay.io/ansible/awx:23.0.0  # Используем конкретную версию
+    container_name: awx
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      AWX_ADMIN_USER: "{{ awx_admin_user }}"
+      AWX_ADMIN_PASSWORD: "{{ awx_admin_password }}"
+      AWX_SECRET_KEY: "{{ awx_secret_key }}"
+      AWX_POSTGRES_HOST: "postgres"
+      AWX_POSTGRES_PORT: 5432
+      AWX_POSTGRES_USER: "{{ awx_postgres_user }}"
+      AWX_POSTGRES_PASSWORD: "{{ awx_postgres_password }}"
+      AWX_POSTGRES_DB: "{{ awx_postgres_database }}"
+      AWX_REDIS_HOST: "redis"
+      AWX_REDIS_PORT: 6379
+    volumes:
+      - awx_projects:/var/lib/awx/projects
+      - /etc/passwd:/etc/passwd:ro
+      - /etc/timezone:/etc/timezone:ro
+
+  awx_nginx:
+    image: nginx:1.25-alpine
+    container_name: awx_nginx
+    restart: unless-stopped
+    ports:
+      - "8080:80"  # Изменён порт с 80 на 8080
+      - "8443:443" # Изменён порт с 443 на 8443
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - awx
+
+volumes:
+  awx_postgres_data:
+  awx_projects:
+
+networks:
+  default:
+    name: awx_network
+```
+
+### 3. Обновлённый task для Ansible
+
+```yaml
+- name: Ensure ports are available
+  command: "fuser -k 443/tcp 80/tcp || true"
+  ignore_errors: yes
+  changed_when: false
+
+- name: Deploy AWX stack
+  community.docker.docker_compose_v2:
+    project_src: "{{ awx_config_dir }}"
+    pull: true
+    build: false
+    state: present
+    restart_policy: unless-stopped
+    recreate: unless-stopped
+    timeout: 600
+  register: compose_result
+  async: 1200
+  poll: 0
+
+- name: Wait for AWX to stabilize
+  community.docker.docker_compose_v2:
+    project_src: "{{ awx_config_dir }}"
+    state: present
+  async: 1200
+  poll: 10
+  until: compose_result is succeeded
+  retries: 30
+  delay: 15
+
+- name: Check AWX container logs
+  command: "docker logs awx"
+  register: awx_logs
+  changed_when: false
+  when: compose_result is succeeded
+
+- name: Display AWX logs if needed
+  debug:
+    var: awx_logs.stdout_lines
+  when: awx_logs.stdout | length > 0
+```
+
+### 4. Дополнительные действия
+
+1. **Проверьте логи**:
+   ```bash
+   docker logs awx
+   docker logs awx_postgres
+   ```
+
+2. **Проверьте сеть**:
+   ```bash
+   docker network inspect awx_network
+   ```
+
+3. **Проверьте версии**:
+   ```bash
+   docker --version
+   docker compose version
+   ```
+
+4. **Если проблема сохраняется**:
+   - Убедитесь, что нет конфликта имён контейнеров
+   - Проверьте доступность ресурсов (память, CPU)
+   - Попробуйте более новую версию AWX (например, 23.1.0)
+
+## Важные изменения:
+1. Изменены порты Nginx (8080/8443 вместо 80/443)
+2. Используется конкретная версия AWX (23.0.0)
+3. Добавлены проверки состояния контейнеров
+4. Улучшена обработка ошибок
+
+После этих изменений AWX должен запуститься на портах 8080 (HTTP) и 8443 (HTTPS). Для доступа используйте `https://your-server:8443`.

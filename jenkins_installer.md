@@ -275,3 +275,224 @@ instance.save()
 ✅ **Интеграция с Vault** (для секретов)  
 
 Этот вариант подходит для **корпоративного использования** с балансом между безопасностью и удобством. Настройки можно кастомизировать под нужды компании.
+
+
+
+Вот **расширенный корпоративный вариант** Jenkins в Docker, включающий **резервное копирование, мониторинг, кластеризацию через Kubernetes, интеграцию с HashiCorp Vault** и другие production-фичи.
+
+---
+
+## 1. Обновлённый `docker-compose.yml` (с мониторингом и резервным копированием)
+```yaml
+version: '3.8'
+
+services:
+  jenkins:
+    image: custom-jenkins  # Собранный образ с плагинами
+    container_name: jenkins
+    restart: unless-stopped
+    user: root
+    environment:
+      - JAVA_OPTS=-Djenkins.install.runSetupWizard=false -Xmx4g -Xms2g
+      - VAULT_ADDR=http://vault:8200  # Интеграция с Vault
+    volumes:
+      - jenkins_data:/var/jenkins_home
+      - docker_sock:/var/run/docker.sock
+    ports:
+      - "50000:50000"
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+    networks:
+      - jenkins_network
+
+  # Reverse Proxy (Nginx + HTTPS)
+  nginx:
+    image: nginx:alpine
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d
+      - ./nginx/ssl:/etc/nginx/ssl
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - jenkins_network
+
+  # HashiCorp Vault для управления секретами
+  vault:
+    image: vault:latest
+    environment:
+      - VAULT_DEV_ROOT_TOKEN_ID=myroot
+      - VAULT_DEV_LISTEN_ADDRESS=0.0.0.0:8200
+    ports:
+      - "8200:8200"
+    volumes:
+      - vault_data:/vault/file
+    networks:
+      - jenkins_network
+
+  # Prometheus + Grafana для мониторинга
+  prometheus:
+    image: prom/prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    networks:
+      - jenkins_network
+
+  grafana:
+    image: grafana/grafana
+    volumes:
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    networks:
+      - jenkins_network
+
+  # Jenkins Agent (Kubernetes-based)
+  jenkins-agent:
+    image: jenkins/inbound-agent:latest
+    environment:
+      - KUBERNETES_NAMESPACE=jenkins
+    networks:
+      - jenkins_network
+
+volumes:
+  jenkins_data:
+  docker_sock:
+  vault_data:
+  grafana_data:
+
+networks:
+  jenkins_network:
+    driver: bridge
+```
+
+---
+
+## 2. **Резервное копирование (BorgBackup + Cron)**
+Добавьте в `Dockerfile`:
+```dockerfile
+RUN apt-get update && apt-get install -y borgbackup
+```
+
+Пример скрипта `backup.sh`:
+```bash
+#!/bin/bash
+export BORG_PASSPHRASE="yourpassphrase"
+borg create --stats /mnt/backups/jenkins::'{now:%Y-%m-%d}' /var/jenkins_home
+borg prune --keep-daily 7 --keep-weekly 4 /mnt/backups/jenkins
+```
+
+Добавьте в `docker-compose.yml`:
+```yaml
+  backup:
+    image: alpine
+    volumes:
+      - jenkins_data:/source
+      - backup_volume:/backup
+    command: sh -c "echo '0 2 * * * /backup/backup.sh' | crontab - && crond -f"
+```
+
+---
+
+## 3. **Мониторинг (Prometheus + Grafana)**
+`prometheus.yml`:
+```yaml
+scrape_configs:
+  - job_name: 'jenkins'
+    metrics_path: '/prometheus'
+    static_configs:
+      - targets: ['jenkins:8080']
+```
+
+Настройки Grafana:
+- Импортируйте дашборд **Jenkins Performance and Health Overview** (ID: **9964**)
+- Добавьте источник данных Prometheus (`http://prometheus:9090`)
+
+---
+
+## 4. **Кластеризация (Jenkins + Kubernetes)**
+1. Установите плагин **Kubernetes** в `plugins.txt`:
+   ```
+   kubernetes
+   ```
+
+2. Настройте `init.groovy.d/k8s.groovy`:
+   ```groovy
+   import org.csanchez.jenkins.plugins.kubernetes.*
+   import jenkins.model.*
+
+   def instance = Jenkins.getInstance()
+   def k8sCloud = new KubernetesCloud(
+     "jenkins-k8s",
+     null,
+     "https://kubernetes.default.svc",
+     "jenkins-agent",
+     "default"
+   )
+   instance.clouds.add(k8sCloud)
+   instance.save()
+   ```
+
+---
+
+## 5. **Интеграция с HashiCorp Vault**
+1. Установите плагин **HashiCorp Vault** в `plugins.txt`:
+   ```
+   hashicorp-vault-plugin
+   ```
+
+2. Настройте `init.groovy.d/vault.groovy`:
+   ```groovy
+   import com.datapipe.jenkins.vault.configuration.*
+   import jenkins.model.*
+
+   def instance = Jenkins.getInstance()
+   def vaultConfig = new VaultConfiguration(
+     "http://vault:8200",
+     "myroot"
+   )
+   instance.getExtensionList(VaultConfiguration.class).add(vaultConfig)
+   instance.save()
+   ```
+
+---
+
+## 6. **Запуск и проверка**
+```bash
+# Собрать и запустить
+docker-compose build
+docker-compose up -d
+
+# Проверить логи
+docker-compose logs -f jenkins
+```
+
+---
+
+### **Итоговая архитектура**
+```
+┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+│   Jenkins   │───▶│ Kubernetes  │───▶│  Docker     │
+└─────────────┘    └─────────────┘    └─────────────┘
+       │                  │                  │
+       ▼                  ▼                  ▼
+┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+│   Vault     │    │ Prometheus  │    │  Nginx      │
+└─────────────┘    └─────────────┘    └─────────────┘
+       │                  │
+       ▼                  ▼
+┌─────────────┐    ┌─────────────┐
+│   BorgBackup│    │  Grafana    │
+└─────────────┘    └─────────────┘
+```
+
+Это решение покрывает все ключевые аспекты enterprise-развёртывания Jenkins:
+- **Отказоустойчивость** (Kubernetes + резервные копии)
+- **Безопасность** (Vault + HTTPS)
+- **Мониторинг** (Prometheus/Grafana)
+- **Масштабируемость** (Kubernetes agents)

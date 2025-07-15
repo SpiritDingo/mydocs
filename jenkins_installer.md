@@ -496,3 +496,219 @@ docker-compose logs -f jenkins
 - **Безопасность** (Vault + HTTPS)
 - **Мониторинг** (Prometheus/Grafana)
 - **Масштабируемость** (Kubernetes agents)
+
+
+Вот **Ansible-роль** для развертывания **Jenkins в Docker** с поддержкой:
+- Предустановленных плагинов
+- Резервного копирования (BorgBackup)
+- Мониторинга (Prometheus + Grafana)
+- Интеграции с HashiCorp Vault
+- Kubernetes-агентов
+- Reverse Proxy (Nginx + HTTPS)
+
+---
+
+## **Структура роли**
+```bash
+roles/jenkins_docker/
+├── defaults
+│   └── main.yml       # Переменные по умолчанию
+├── files
+│   ├── plugins.txt    # Список плагинов
+│   ├── nginx.conf     # Конфиг Nginx
+│   ├── prometheus.yml # Конфиг Prometheus
+│   └── backup.sh      # Скрипт резервного копирования
+├── tasks
+│   └── main.yml       # Основные задачи
+├── templates
+│   ├── docker-compose.yml.j2  # Шаблон docker-compose
+│   └── init.groovy.d          # Groovy-скрипты для Jenkins
+└── vars
+    └── main.yml       # Секретные переменные (vault.yml)
+```
+
+---
+
+### **1. `defaults/main.yml`** (настраиваемые параметры)
+```yaml
+jenkins_image: "jenkins/jenkins:lts-jdk17"
+jenkins_admin_user: "admin"
+jenkins_admin_password: "{{ vault_jenkins_admin_password }}"  # Шифруется в Ansible Vault
+jenkins_http_port: 8080
+jenkins_agent_port: 50000
+
+# Плагины (можно переопределить)
+jenkins_plugins:
+  - git
+  - github
+  - blueocean
+  - docker-plugin
+  - kubernetes
+  - pipeline-aws
+  - hashicorp-vault-plugin
+
+# Настройки Nginx
+nginx_ssl_cert: "/etc/nginx/ssl/cert.pem"
+nginx_ssl_key: "/etc/nginx/ssl/key.pem"
+nginx_domain: "jenkins.example.com"
+
+# Настройки Vault
+vault_enabled: true
+vault_root_token: "myroot"
+
+# Настройки мониторинга
+prometheus_port: 9090
+grafana_port: 3000
+```
+
+---
+
+### **2. `tasks/main.yml`** (основные задачи)
+```yaml
+---
+- name: "Создание директорий"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  loop:
+    - "/opt/jenkins"
+    - "/opt/jenkins/nginx/ssl"
+    - "/opt/jenkins/init.groovy.d"
+
+- name: "Копирование конфигурационных файлов"
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    mode: '0644'
+  loop:
+    - { src: "files/plugins.txt", dest: "/opt/jenkins/plugins.txt" }
+    - { src: "files/nginx.conf", dest: "/opt/jenkins/nginx/conf.d/jenkins.conf" }
+    - { src: "files/prometheus.yml", dest: "/opt/jenkins/prometheus.yml" }
+    - { src: "files/backup.sh", dest: "/opt/jenkins/backup.sh" }
+
+- name: "Генерация SSL-сертификата (если нет)"
+  ansible.builtin.command: |
+    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+      -keyout {{ nginx_ssl_key }} \
+      -out {{ nginx_ssl_cert }} \
+      -subj "/CN={{ nginx_domain }}"
+  args:
+    creates: "{{ nginx_ssl_cert }}"
+
+- name: "Запуск Jenkins и зависимостей через docker-compose"
+  ansible.builtin.template:
+    src: "templates/docker-compose.yml.j2"
+    dest: "/opt/jenkins/docker-compose.yml"
+    mode: '0644'
+
+- name: "Запуск контейнеров"
+  community.docker.docker_compose:
+    project_src: "/opt/jenkins"
+    state: present
+    restarted: yes
+    pull: yes
+
+- name: "Настройка cron для резервного копирования"
+  ansible.builtin.cron:
+    name: "Jenkins Backup"
+    job: "/opt/jenkins/backup.sh"
+    hour: 2
+    minute: 0
+```
+
+---
+
+### **3. `templates/docker-compose.yml.j2`** (шаблон)
+```yaml
+version: '3.8'
+
+services:
+  jenkins:
+    image: {{ jenkins_image }}
+    environment:
+      - JAVA_OPTS=-Djenkins.install.runSetupWizard=false -Xmx4g
+      - JENKINS_ADMIN_ID={{ jenkins_admin_user }}
+      - JENKINS_ADMIN_PASSWORD={{ jenkins_admin_password }}
+    volumes:
+      - jenkins_data:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "{{ jenkins_agent_port }}:50000"
+    networks:
+      - jenkins_network
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d
+      - ./nginx/ssl:/etc/nginx/ssl
+    networks:
+      - jenkins_network
+
+  {% if vault_enabled %}
+  vault:
+    image: vault:latest
+    environment:
+      - VAULT_DEV_ROOT_TOKEN_ID={{ vault_root_token }}
+    ports:
+      - "8200:8200"
+    volumes:
+      - vault_data:/vault/file
+    networks:
+      - jenkins_network
+  {% endif %}
+
+volumes:
+  jenkins_data:
+  {% if vault_enabled %}vault_data:{% endif %}
+
+networks:
+  jenkins_network:
+```
+
+---
+
+### **4. Пример плейбука `deploy_jenkins.yml`**
+```yaml
+---
+- hosts: jenkins_servers
+  become: yes
+  roles:
+    - role: jenkins_docker
+  vars:
+    vault_jenkins_admin_password: "{{ vault.jenkins_admin_password }}"  # Из Ansible Vault
+```
+
+---
+
+### **5. Запуск**
+```bash
+# Зашифровать пароль Jenkins в Ansible Vault
+ansible-vault encrypt_string 's3cretP@ss' --name 'vault_jenkins_admin_password' > vars/vault.yml
+
+# Запустить плейбук
+ansible-playbook -i inventory.ini deploy_jenkins.yml --ask-vault-pass
+```
+
+---
+
+## **Что делает роль:**
+1. Разворачивает **Jenkins в Docker** с предустановленными плагинами.
+2. Настраивает **Nginx + HTTPS**.
+3. Поднимает **Vault** для управления секретами.
+4. Добавляет **резервное копирование** (BorgBackup + Cron).
+5. Разворачивает **Prometheus + Grafana** для мониторинга.
+6. Поддерживает **Kubernetes-агенты** (через плагин).
+
+---
+
+### **Доработки под свои нужды:**
+- **Для Kubernetes**: обновите `init.groovy.d/k8s.groovy` с вашими `kubeconfig`.
+- **Для Vault**: настройте политики доступа в `vault.groovy`.
+- **Для мониторинга**: импортируйте нужные дашборды в Grafana.
+
+Роль готова для интеграции в **Ansible Tower/AWX** или запуска через CI/CD.

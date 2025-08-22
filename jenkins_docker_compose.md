@@ -1152,3 +1152,622 @@ docker-compose up -d
 · Networking: Traefik как reverse proxy с автоматическим SSL
 
 Это enterprise-уровень IaC платформы, готовый для production использования!
+
+
+
+
+Вот модифицированный вариант с интеграцией внешнего GitLab вместо Nexus:
+
+1. Обновленный .env файл
+
+```env
+# Project
+COMPOSE_PROJECT_NAME=iac-platform
+DOMAIN=iac.local
+
+# Jenkins
+JENKINS_ADMIN_ID=admin
+JENKINS_ADMIN_PASSWORD=admin123
+JENKINS_URL=http://jenkins:8080
+
+# GitLab Integration
+GITLAB_URL=https://gitlab.example.com
+GITLAB_API_TOKEN=glpat-your-gitlab-token
+GITLAB_GROUP=iac-projects
+GITLAB_CI_SERVER_URL=https://gitlab.example.com
+
+# Ansible
+ANSIBLE_CONFIG=/ansible/ansible.cfg
+
+# Terraform
+TF_VAR_region=us-east-1
+TF_VAR_environment=development
+
+# Vault
+VAULT_DEV_ROOT_TOKEN_ID=root-token-123
+VAULT_DEV_LISTEN_ADDRESS=0.0.0.0:8200
+
+# Database
+POSTGRES_DB=jenkins
+POSTGRES_USER=jenkins
+POSTGRES_PASSWORD=jenkins123
+
+# Networking
+TRAEFIK_NETWORK=traefik-net
+INTERNAL_NETWORK=internal-net
+```
+
+2. Обновленный docker-compose.yml (без Nexus)
+
+```yaml
+version: '3.8'
+
+x-common-variables: &common-variables
+  DOMAIN: ${DOMAIN}
+  TZ: UTC
+  GITLAB_URL: ${GITLAB_URL}
+  GITLAB_API_TOKEN: ${GITLAB_API_TOKEN}
+
+x-common-labels: &common-labels
+  - "traefik.enable=true"
+  - "traefik.docker.network=traefik-net"
+
+services:
+  # Reverse Proxy
+  traefik:
+    image: traefik:v2.10
+    container_name: traefik
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8081:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/traefik.yml:/etc/traefik/traefik.yml
+      - ./traefik/config/:/etc/traefik/config/
+      - ./traefik/certs/:/etc/traefik/certs/
+    networks:
+      - traefik-net
+    labels:
+      - "traefik.http.routers.traefik.rule=Host(`traefik.${DOMAIN}`)"
+      - "traefik.http.routers.traefik.service=api@internal"
+
+  # Jenkins Master with GitLab Integration
+  jenkins:
+    image: jenkins/jenkins:lts-jdk17
+    container_name: jenkins
+    restart: unless-stopped
+    environment:
+      <<: *common-variables
+      JAVA_OPTS: >
+        -Djenkins.install.runSetupWizard=false
+        -Dcasc.jenkins.config=/var/jenkins_home/casc/config.yaml
+        -Xmx2048m
+        -Xms512m
+      JENKINS_OPTS: --httpPort=8080
+      GITLAB_URL: ${GITLAB_URL}
+      GITLAB_API_TOKEN: ${GITLAB_API_TOKEN}
+    volumes:
+      - jenkins_data:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./jenkins/casc/:/var/jenkins_home/casc/
+      - ./jenkins/scripts/:/var/jenkins_home/init.groovy.d/
+      - ./ansible/:/var/jenkins_home/ansible/
+      - ./terraform/:/var/jenkins_home/terraform/
+      - ./ssh-keys/:/ssh-keys/
+      - ./shared-data/:/shared-data/
+      - ./gitlab-config/:/etc/gitlab-config/
+    labels:
+      <<: *common-labels
+      - "traefik.http.routers.jenkins.rule=Host(`jenkins.${DOMAIN}`)"
+      - "traefik.http.services.jenkins.loadbalancer.server.port=8080"
+    networks:
+      - traefik-net
+      - internal-net
+    depends_on:
+      - postgres
+      - redis
+
+  # GitLab Runner for CI/CD
+  gitlab-runner:
+    image: gitlab/gitlab-runner:alpine
+    container_name: gitlab-runner
+    restart: unless-stopped
+    environment:
+      CI_SERVER_URL: ${GITLAB_CI_SERVER_URL}
+      REGISTRATION_TOKEN: ${GITLAB_RUNNER_TOKEN}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./gitlab-runner/config/:/etc/gitlab-runner/
+      - ./shared-data/:/shared-data/
+    networks:
+      - internal-net
+    command: 
+      - run
+      - --user=gitlab-runner
+      - --working-directory=/home/gitlab-runner
+
+  # Ansible Controller with GitLab integration
+  ansible:
+    image: quay.io/ansible/awx-ee:latest
+    container_name: ansible-controller
+    restart: unless-stopped
+    environment:
+      <<: *common-variables
+      ANSIBLE_CONFIG: /ansible/ansible.cfg
+      ANSIBLE_FORCE_COLOR: "true"
+      GITLAB_URL: ${GITLAB_URL}
+      GITLAB_TOKEN: ${GITLAB_API_TOKEN}
+    volumes:
+      - ./ansible/:/ansible/
+      - ./inventory/:/inventory/
+      - ./ssh-keys/:/ssh-keys/
+      - ./shared-data/:/shared-data/
+      - ./vault/:/vault/
+      - ./gitlab-config/:/etc/gitlab/
+    working_dir: /ansible
+    networks:
+      - internal-net
+    command: ["sleep", "infinity"]
+
+  # Terraform with GitLab integration
+  terraform:
+    image: hashicorp/terraform:1.5
+    container_name: terraform-runner
+    restart: unless-stopped
+    environment:
+      <<: *common-variables
+      TF_DATA_DIR: /terraform/.terraform
+      TF_PLUGIN_CACHE_DIR: /terraform/.terraform.d/plugin-cache
+      GITLAB_TOKEN: ${GITLAB_API_TOKEN}
+    volumes:
+      - ./terraform/:/terraform/
+      - ./shared-data/:/shared-data/
+      - ./ssh-keys/:/ssh-keys/
+      - terraform_cache:/terraform/.terraform.d
+      - ./gitlab-config/:/etc/gitlab/
+    working_dir: /terraform
+    networks:
+      - internal-net
+    command: ["sleep", "infinity"]
+
+  # Остальные сервисы (Vault, PostgreSQL, Redis, Monitoring) остаются без изменений
+  # ... [vault, postgres, redis, prometheus, grafana, loki, promtail]
+
+networks:
+  traefik-net:
+    driver: bridge
+    attachable: true
+  internal-net:
+    driver: bridge
+    internal: true
+
+volumes:
+  # ... [остальные volumes без nexus_data]
+```
+
+3. Обновленная Jenkins Configuration as Code
+
+jenkins/casc/config.yaml
+
+```yaml
+jenkins:
+  systemMessage: "Enterprise IaC Platform with GitLab Integration v2.0"
+  numExecutors: 5
+  mode: EXCLUSIVE
+  securityRealm:
+    local:
+      allowsSignup: false
+      users:
+        - id: ${JENKINS_ADMIN_ID}
+          password: ${JENKINS_ADMIN_PASSWORD}
+  authorizationStrategy:
+    globalMatrix:
+      permissions:
+        - "Overall/Administer:admin"
+        - "Overall/Read:authenticated"
+        - "Job/Build:authenticated"
+        - "Job/Read:authenticated"
+
+unclassified:
+  location:
+    url: http://jenkins.${DOMAIN}:8080/
+  shell:
+    shell: "/bin/bash"
+  gitlabConnectionConfig:
+    connections:
+      - name: "gitlab-connection"
+        url: ${GITLAB_URL}
+        apiTokenId: "gitlab-api-token"
+        connectionTimeout: 10
+        readTimeout: 10
+        clientBuilderId: "autodetect"
+
+tool:
+  git:
+    installations:
+      - name: "default"
+        home: "/usr/bin/git"
+  jdk:
+    installations:
+      - name: "jdk17"
+        home: "/usr/lib/jvm/java-17-openjdk"
+
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          - string:
+              scope: GLOBAL
+              id: "vault-token"
+              secret: ${VAULT_DEV_ROOT_TOKEN_ID}
+              description: "Vault Root Token"
+          - basicSSHUserPrivateKey:
+              scope: GLOBAL
+              id: "ansible-ssh-key"
+              username: "ubuntu"
+              privateKeySource:
+                directEntry:
+                  privateKey: ${SSH_PRIVATE_KEY}
+          - string:
+              scope: GLOBAL
+              id: "gitlab-api-token"
+              secret: ${GITLAB_API_TOKEN}
+              description: "GitLab API Token"
+          - usernamePassword:
+              scope: GLOBAL
+              id: "gitlab-credentials"
+              username: "gitlab-ci"
+              password: ${GITLAB_API_TOKEN}
+              description: "GitLab CI Credentials"
+
+jobs:
+  - script: >
+      pipelineJob('GitLab-Webhook-Trigger') {
+        definition {
+          cpsScm {
+            scm {
+              git {
+                remote {
+                  url('${GITLAB_URL}/${GITLAB_GROUP}/iac-infrastructure.git')
+                  credentials('gitlab-credentials')
+                }
+                branches('main', 'develop')
+                extensions {
+                  cloneOptions {
+                    timeout(10)
+                  }
+                }
+              }
+            }
+            scriptPath('Jenkinsfile')
+          }
+        }
+        triggers {
+          gitLabPush {
+            buildOnMergeRequestEvents(true)
+            buildOnPushEvents(true)
+            includeBranches('main', 'develop')
+          }
+        }
+      }
+```
+
+4. Конфигурация GitLab Runner
+
+gitlab-runner/config/config.toml
+
+```toml
+concurrent = 4
+check_interval = 0
+
+[session_server]
+  session_timeout = 1800
+
+[[runners]]
+  name = "iac-platform-runner"
+  url = "${GITLAB_CI_SERVER_URL}"
+  token = "${GITLAB_RUNNER_TOKEN}"
+  executor = "docker"
+  [runners.custom_build_dir]
+  [runners.cache]
+    [runners.cache.s3]
+    [runners.cache.gcs]
+    [runners.cache.azure]
+  [runners.docker]
+    tls_verify = false
+    image = "alpine:latest"
+    privileged = true
+    disable_entrypoint_overwrite = false
+    oom_kill_disable = false
+    disable_cache = false
+    volumes = [
+      "/var/run/docker.sock:/var/run/docker.sock",
+      "/cache",
+      "/shared-data:/shared-data"
+    ]
+    shm_size = 0
+    network_mode = "iac-platform_internal-net"
+```
+
+5. Обновленный Ansible Configuration
+
+ansible/ansible.cfg
+
+```ini
+[defaults]
+inventory = /inventory/development/hosts.yml
+remote_user = ubuntu
+private_key_file = /ssh-keys/id_rsa
+host_key_checking = False
+retry_files_enabled = False
+stdout_callback = yaml
+diff = True
+forks = 20
+timeout = 30
+log_path = /ansible/logs/ansible.log
+callback_whitelist = profile_tasks, timer, yaml
+
+[privilege_escalation]
+become = True
+become_method = sudo
+become_user = root
+become_ask_pass = False
+
+[ssh_connection]
+ssh_args = -o ControlMaster=auto -o ControlPersist=3600s -o UserKnownHostsFile=/dev/null
+pipelining = True
+scp_if_ssh = True
+
+[galaxy]
+server_list = gitlab_galaxy
+
+[galaxy_server.gitlab_galaxy]
+url = ${GITLAB_URL}/api/v4/projects/packages/ansible/
+token = ${GITLAB_TOKEN}
+
+[inventory]
+cache = True
+cache_plugin = jsonfile
+cache_timeout = 3600
+```
+
+6. Скрипты для интеграции с GitLab
+
+scripts/gitlab-integration.sh
+
+```bash
+#!/bin/bash
+
+# Configure GitLab integration
+echo "Configuring GitLab integration..."
+
+# Create GitLab configuration directory
+mkdir -p gitlab-config
+
+# Generate GitLab CI configuration
+cat > gitlab-config/.gitlab-ci.yml << EOF
+stages:
+  - test
+  - build
+  - deploy
+
+variables:
+  ANSIBLE_FORCE_COLOR: "1"
+  TF_INPUT: "0"
+
+before_script:
+  - apt-get update -y
+  - apt-get install -y python3 python3-pip
+  - pip3 install ansible
+
+ansible-lint:
+  stage: test
+  image: quay.io/ansible/ansible-runner:latest
+  script:
+    - ansible-lint ansible/playbooks/
+
+terraform-validate:
+  stage: test
+  image: hashicorp/terraform:1.5
+  script:
+    - terraform init
+    - terraform validate
+
+deploy-infrastructure:
+  stage: deploy
+  image: quay.io/ansible/ansible-runner:latest
+  script:
+    - ansible-playbook -i inventory/production/ playbooks/deploy.yml
+  only:
+    - main
+  environment: production
+EOF
+
+# Create GitLab API helper script
+cat > scripts/gitlab-api.sh << 'EOF'
+#!/bin/bash
+
+GITLAB_URL="${GITLAB_URL:-https://gitlab.example.com}"
+GITLAB_TOKEN="${GITLAB_API_TOKEN}"
+
+gitlab_api() {
+  local endpoint="$1"
+  local method="${2:-GET}"
+  local data="${3:-}"
+  
+  curl -s -X "$method" \
+    -H "Content-Type: application/json" \
+    -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+    "$GITLAB_URL/api/v4/$endpoint" \
+    ${data:+-d "$data"}
+}
+
+# Create project in GitLab
+create_project() {
+  local project_name="$1"
+  local group_name="${2:-$GITLAB_GROUP}"
+  
+  gitlab_api "projects" "POST" "{
+    \"name\": \"$project_name\",
+    \"namespace_id\": $(get_group_id \"$group_name\"),
+    \"visibility\": \"internal\"
+  }"
+}
+
+get_group_id() {
+  local group_name="$1"
+  gitlab_api "groups/$group_name" | jq -r '.id'
+}
+
+# Create webhook for Jenkins
+create_webhook() {
+  local project_id="$1"
+  local jenkins_url="$2"
+  
+  gitlab_api "projects/$project_id/hooks" "POST" "{
+    \"url\": \"$jenkins_url/project/GitLab-Webhook-Trigger\",
+    \"push_events\": true,
+    \"merge_requests_events\": true,
+    \"enable_ssl_verification\": false
+  }"
+}
+EOF
+
+chmod +x scripts/gitlab-api.sh
+echo "GitLab integration configured!"
+```
+
+7. Jenkins Pipeline для GitLab
+
+Jenkinsfile
+
+```groovy
+pipeline {
+    agent any
+    
+    environment {
+        GITLAB_URL = "${env.GITLAB_URL}"
+        GITLAB_TOKEN = credentials('gitlab-api-token')
+        ANSIBLE_CONFIG = 'ansible/ansible.cfg'
+    }
+    
+    options {
+        gitLabConnection('gitlab-connection')
+        timeout(time: 1, unit: 'HOURS')
+    }
+    
+    triggers {
+        gitLab(
+            triggerOnPush: true,
+            triggerOnMergeRequest: true,
+            branchFilterType: 'All'
+        )
+    }
+    
+    stages {
+        stage('Checkout from GitLab') {
+            steps {
+                git branch: '${gitlabSourceBranch}',
+                credentialsId: 'gitlab-credentials',
+                url: "${GITLAB_URL}/${GITLAB_GROUP}/${env.gitlabTargetRepo}.git"
+                
+                script {
+                    currentBuild.description = "GitLab: ${env.gitlabSourceRepo} → ${env.gitlabTargetRepo}"
+                }
+            }
+        }
+        
+        stage('Ansible Syntax Check') {
+            steps {
+                sh '''
+                cd ansible
+                ansible-playbook --syntax-check playbooks/deploy.yml
+                ansible-lint playbooks/
+                '''
+            }
+        }
+        
+        stage('Terraform Plan') {
+            steps {
+                sh '''
+                cd terraform
+                terraform init
+                terraform plan -out=tfplan
+                '''
+            }
+        }
+        
+        stage('Deploy Infrastructure') {
+            when {
+                branch 'main'
+            }
+            steps {
+                withCredentials([sshUserPrivateKey(
+                    credentialsId: 'ansible-ssh-key',
+                    keyFileVariable: 'SSH_KEY'
+                )]) {
+                    sh '''
+                    cd ansible
+                    ansible-playbook -i inventory/production/ \
+                    playbooks/deploy.yml --private-key $SSH_KEY
+                    '''
+                }
+            }
+        }
+        
+        stage('Notify GitLab') {
+            steps {
+                script {
+                    if (currentBuild.result == 'SUCCESS') {
+                        updateGitlabCommitStatus name: 'jenkins', state: 'success'
+                    } else {
+                        updateGitlabCommitStatus name: 'jenkins', state: 'failed'
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            cleanWs()
+            script {
+                def duration = currentBuild.durationString.replace(' and counting', '')
+                slackSend(
+                    message: "Build ${currentBuild.result}: ${env.JOB_NAME} #${env.BUILD_NUMBER} (${duration})",
+                    color: currentBuild.result == 'SUCCESS' ? 'good' : 'danger'
+                )
+            }
+        }
+    }
+}
+```
+
+Установка и настройка
+
+1. Настройка GitLab:
+
+```bash
+# Получите токен из GitLab: Settings → Access Tokens
+echo "GITLAB_API_TOKEN=glpat-your-actual-token" >> .env
+echo "GITLAB_RUNNER_TOKEN=your-runner-token" >> .env
+
+# Запустите интеграцию
+chmod +x scripts/gitlab-integration.sh
+./scripts/gitlab-integration.sh
+```
+
+1. Запуск платформы:
+
+```bash
+docker-compose up -d
+```
+
+1. Настройка webhook в GitLab:
+   · В GitLab: Project → Settings → Webhooks
+   · URL: http://jenkins.iac.local/project/GitLab-Webhook-Trigger
+   · Trigger: Push events, Merge request events
+
+Теперь у вас полная интеграция с внешним GitLab для end-to-end CI/CD!

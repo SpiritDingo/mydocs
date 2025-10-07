@@ -324,3 +324,221 @@ ansible-galaxy collection install -r requirements.yml
 Если вы используете **Ansible Collections** (а не только роли), можно добавить отдельный подраздел про структуру коллекций. Также можно приложить **чек-лист ревью** для merge request’ов.
 
 Нужен шаблон `.ansible-lint`, пример `ansible.cfg` или CI-пайплайн для проверки ролей?
+
+Отлично! Ниже вы найдёте:
+
+1. **Шаблон `.ansible-lint`** — конфигурация линтера для соблюдения стандартов кода.  
+2. **Пример `ansible.cfg`** — централизованная конфигурация Ansible.  
+3. **Пример CI/CD-пайплайна** (на основе GitLab CI, но легко адаптируется под GitHub Actions/Jenkins) для автоматической проверки ролей и плейбуков.
+
+Все файлы соответствуют best practices и могут быть включены в ваш регламент как приложения.
+
+---
+
+## 1. Шаблон `.ansible-lint`
+
+Файл `.ansible-lint` размещается в корне репозитория и настраивает поведение `ansible-lint`.
+
+```yaml
+# .ansible-lint
+---
+# Уровень строгости: production (рекомендуется)
+strict: true
+
+# Отключение правил (только при обоснованной необходимости!)
+skip_list:
+  # Пример: отключить правило о дублировании задач (если используется include)
+  # - 'no-duplicate-tasks'
+  # - 'yaml[line-length]'  # если не хотите ограничение 120 символов
+
+# Пути для анализа (по умолчанию — всё, но можно уточнить)
+exclude_paths:
+  - .git/
+  - .venv/
+  - tests/
+  - .cache/
+
+# Плагины (если используются кастомные)
+# rulesdir: ./lint-rules/
+
+# Формат вывода (default, codeclimate, sarif и др.)
+format: default
+```
+
+> 💡 **Совет**: Не отключайте правила без веской причины. При необходимости — документируйте исключения в комментариях кода с помощью `# noqa <rule-id>`.
+
+---
+
+## 2. Пример `ansible.cfg`
+
+Файл `ansible.cfg` в корне проекта обеспечивает единообразное поведение Ansible для всех участников команды и CI.
+
+```ini
+# ansible.cfg
+[defaults]
+# Пути
+inventory = inventories/production/hosts.ini
+roles_path = roles
+collections_paths = collections
+
+# Безопасность
+host_key_checking = True
+deprecation_warnings = False
+command_warnings = False
+
+# Читаемость вывода
+stdout_callback = yaml
+callback_whitelist = profile_tasks, timer
+
+# Факты
+gathering = smart
+fact_caching = jsonfile
+fact_caching_connection = /tmp/ansible_fact_cache
+fact_caching_timeout = 86400
+
+# Улучшение производительности
+forks = 20
+pipelining = True
+ssh_args = -o ControlMaster=auto -o ControlPersist=60s -o PreferredAuthentications=publickey
+control_path = %(directory)s/%%h-%%r
+
+# Vault
+vault_password_file = .vault_pass.py  # или .vault_pass (если plaintext, но не в репо!)
+
+# Коллекции
+interpreter_python = auto_silent
+
+[inventory]
+# Разрешить использование плагинов inventory (например, AWS EC2 dynamic inventory)
+enable_plugins = host_list, script, auto, yaml, ini, toml
+
+[ssh_connection]
+ssh_args = -o ControlMaster=auto -o ControlPersist=60s -o PreferredAuthentications=publickey
+control_path_dir = ~/.ansible/cp
+```
+
+> ⚠️ **Важно**:  
+> - Файл `.vault_pass.py` (или `.vault_pass`) **не должен попадать в Git**. Используйте CI-переменные или секрет-менеджеры.  
+> - Для CI можно переопределять `inventory` и `vault_password_file` через переменные окружения (`ANSIBLE_INVENTORY`, `ANSIBLE_VAULT_PASSWORD_FILE`).
+
+---
+
+## 3. Пример CI/CD-пайплайна (GitLab CI)
+
+Файл `.gitlab-ci.yml` — автоматическая проверка при пуше или MR.
+
+```yaml
+# .gitlab-ci.yml
+stages:
+  - lint
+  - test
+  - validate
+
+variables:
+  ANSIBLE_FORCE_COLOR: "1"
+  ANSIBLE_HOST_KEY_CHECKING: "False"
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+cache:
+  paths:
+    - .cache/pip
+    - .venv/
+
+before_script:
+  - python -V
+  - pip install virtualenv
+  - virtualenv .venv
+  - source .venv/bin/activate
+  - pip install --upgrade pip
+  - pip install ansible ansible-lint yamllint molecule[docker] testinfra
+
+lint:ansible:
+  stage: lint
+  script:
+    - ansible-lint --version
+    - ansible-lint -v
+
+lint:yamllint:
+  stage: lint
+  script:
+    - yamllint -c .yamllint .
+
+test:roles:
+  stage: test
+  services:
+    - docker:dind
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  script:
+    - |
+      for role in roles/*; do
+        if [ -d "$role" ]; then
+          echo "🧪 Testing role: $(basename $role)"
+          cd "$role"
+          if [ -f "molecule/default/molecule.yml" ]; then
+            molecule test
+          else
+            echo "⚠️  No Molecule config — skipping"
+          fi
+          cd "$CI_PROJECT_DIR"
+        fi
+      done
+
+validate:syntax:
+  stage: validate
+  script:
+    - ansible-playbook --syntax-check playbooks/*.yml
+```
+
+### Дополнительно: `.yamllint` (для проверки YAML-синтаксиса)
+
+```yaml
+# .yamllint
+---
+extends: default
+
+rules:
+  line-length:
+    max: 120
+    level: warning
+  braces:
+    min-spaces-inside: 0
+    max-spaces-inside: 1
+  brackets:
+    min-spaces-inside: 0
+    max-spaces-inside: 1
+  truthy:
+    allowed-values: ["true", "false", "on", "off", "yes", "no"]
+    check-keys: false
+  comments:
+    min-spaces-from-content: 1
+```
+
+---
+
+## Как использовать
+
+1. Поместите `.ansible-lint`, `ansible.cfg`, `.yamllint` в корень репозитория.
+2. Настройте CI/CD (GitLab CI, GitHub Actions и т.д.) по примеру выше.
+3. Обязательно добавьте в `.gitignore`:
+   ```
+   .vault_pass
+   .vault_pass.py
+   .venv/
+   *.retry
+   /tmp/
+   ```
+
+---
+
+## Адаптация под другие CI
+
+- **GitHub Actions**: используйте официальный action [`ansible-lint`](https://github.com/ansible/ansible-lint) и `molecule` через `actions/setup-python`.
+- **Jenkins**: запускайте те же команды в pipeline-скрипте с виртуальным окружением.
+
+---
+
+Если вы используете **Ansible AWX/Tower**, можно также добавить раздел о синхронизации проектов из Git и проверке через Job Templates.
+
+Нужны шаблоны для GitHub Actions или пример Molecule-конфигурации для роли?

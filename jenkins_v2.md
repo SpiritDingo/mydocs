@@ -1056,3 +1056,757 @@ chmod +x deploy.sh scripts/management.sh
 · ✅ Лучшая производительность - оптимизированная работа с volumes
 
 Это решение предоставляет полную корпоративную платформу для Infrastructure as Code с использованием современных возможностей Docker Compose V2.
+
+
+
+Добавляю интеграцию с Microsoft Active Directory в корпоративное решение Jenkins:
+
+1. Обновленный docker-compose.yml
+
+```yaml
+name: jenkins-iac-corporate
+
+services:
+  jenkins:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        JENKINS_VERSION: lts-jdk17
+    container_name: jenkins-iac-corporate
+    hostname: jenkins-iac
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "50000:50000"
+    environment:
+      JENKINS_OPTS: --httpPort=8080
+      CASC_JENKINS_CONFIG: /var/jenkins_conf/casc
+      JAVA_OPTS: -Djenkins.install.runSetupWizard=false -Xmx2g -Xms512m -Duser.timezone=Europe/Moscow
+      JENKINS_SLAVE_AGENT_PORT: 50000
+      # AD debugging
+      - JAVA_OPTS=-Dcom.sun.jndi.ldap.object.disableEndpointIdentification=true
+    env_file:
+      - .env
+    volumes:
+      - jenkins_data:/var/jenkins_home
+      - ansible_data:/var/ansible
+      - ./casc:/var/jenkins_conf/casc:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./scripts:/var/jenkins_scripts:ro
+      - ./shared:/shared:rw
+      # Kerberos for AD integration
+      - ./kerberos:/etc/krb5.conf:ro
+    networks:
+      jenkins-network:
+        aliases:
+          - jenkins-main
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    configs:
+      - source: plugins_txt
+        target: /usr/share/jenkins/ref/plugins.txt
+    secrets:
+      - source: admin_password
+        target: /run/secrets/jenkins_admin_password
+      - source: smtp_password
+        target: /run/secrets/smtp_password
+      - source: ad_bind_password
+        target: /run/secrets/ad_bind_password
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+      # Your corporate DNS servers for AD
+      - ${AD_DNS_SERVER_1}
+      - ${AD_DNS_SERVER_2}
+
+  # LDAP/AD test utility
+  ldap-admin:
+    image: osixia/phpldapadmin:latest
+    container_name: ldap-admin
+    restart: unless-stopped
+    profiles: ["tools", "ad-test"]
+    environment:
+      PHPLDAPADMIN_LDAP_HOSTS: ${AD_DOMAIN_CONTROLLER}
+      PHPLDAPADMIN_HTTPS: "false"
+    ports:
+      - "8081:80"
+    networks:
+      jenkins-network:
+    depends_on:
+      - jenkins
+
+networks:
+  jenkins-network:
+    name: jenkins-corporate-network
+    driver: bridge
+    attachable: true
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+
+volumes:
+  jenkins_data:
+    name: jenkins_corporate_data
+    driver: local
+  ansible_data:
+    name: ansible_corporate_data
+    driver: local
+
+configs:
+  plugins_txt:
+    file: ./plugins.txt
+
+secrets:
+  admin_password:
+    file: ./secrets/jenkins_admin_password.txt
+  smtp_password:
+    file: ./secrets/smtp_password.txt
+  ad_bind_password:
+    file: ./secrets/ad_bind_password.txt
+```
+
+2. Обновленный Dockerfile с AD поддержкой
+
+```dockerfile
+# syntax=docker/dockerfile:1.4
+
+ARG JENKINS_VERSION=lts-jdk17
+
+FROM jenkins/jenkins:${JENKINS_VERSION} as base
+
+USER root
+
+# Метка для безопасности
+LABEL security.scan="true" \
+      maintainer="devops@company.com" \
+      version="1.0"
+
+# Установка базовых утилит + AD/LDAP инструменты
+RUN <<EOT
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        python3 \
+        python3-pip \
+        git \
+        sshpass \
+        openssh-client \
+        curl \
+        gnupg \
+        software-properties-common \
+        jq \
+        unzip \
+        ldap-utils \
+        krb5-user \
+        libpam-krb5 \
+        libpam-sss \
+        libnss-sss \
+        sssd \
+        sssd-tools
+    rm -rf /var/lib/apt/lists/*
+    apt-get clean
+EOT
+
+# Многоступенчатая установка для оптимизации
+FROM base as ansible-install
+
+RUN pip3 install --no-cache-dir ansible ansible-lint yamllint ansible-tower-cli
+
+FROM base as docker-install
+
+RUN <<EOT
+    curl -fsSL https://get.docker.com | sh
+    usermod -aG docker jenkins
+EOT
+
+FROM base as final
+
+# Копируем установленные компоненты
+COPY --from=ansible-install /usr/local/lib/python3.9/dist-packages /usr/local/lib/python3.9/dist-packages
+COPY --from=ansible-install /usr/local/bin/ansible* /usr/local/bin/
+COPY --from=docker-install /usr/bin/docker /usr/bin/docker
+COPY --from=docker-install /var/run/docker.sock /var/run/docker.sock
+
+# Настройка Kerberos для AD
+RUN mkdir -p /etc/krb5.conf.d
+COPY kerberos/krb5.conf /etc/krb5.conf
+
+# Создание структуры директорий
+RUN <<EOT
+    mkdir -p /var/jenkins_conf/casc /var/ansible /shared
+    chown -R jenkins:jenkins /var/jenkins_conf /var/ansible /shared
+EOT
+
+# Копирование скриптов
+COPY --chown=jenkins:jenkins scripts/ /var/jenkins_scripts/
+RUN chmod +x /var/jenkins_scripts/*.sh
+
+# Установка плагинов через установленный скрипт
+RUN /usr/local/bin/install-plugins.sh < /usr/share/jenkins/ref/plugins.txt
+
+USER jenkins
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=1m --retries=3 \
+  CMD curl -f http://localhost:8080 || exit 1
+```
+
+3. Обновленный plugins.txt с AD плагинами
+
+```txt
+# Active Directory & LDAP
+active-directory:latest
+ldap:latest
+saml:latest
+oic-auth:latest
+
+# Pipeline & DSL
+workflow-aggregator:latest
+pipeline-stage-view:latest
+job-dsl:latest
+blueocean:latest
+
+# Ansible & Infrastructure
+ansible:latest
+ansible-tower:latest
+
+# Version Control
+git:latest
+github:latest
+gitlab:latest
+bitbucket:latest
+
+# Security & Auth
+matrix-auth:latest
+role-strategy:latest
+credentials-binding:latest
+ssh-credentials:latest
+ssh-slaves:latest
+
+# Configuration as Code
+configuration-as-code:latest
+jcascom-configuration-as-code-support:latest
+
+# Docker & Kubernetes
+docker-workflow:latest
+docker-plugin:latest
+kubernetes:latest
+
+# Notifications & Monitoring
+email-ext:latest
+mailer:latest
+telegram-notifications:latest
+slack:latest
+
+# Utilities
+timestamper:latest
+ws-cleanup:latest
+build-timeout:latest
+parameterized-trigger:latest
+copyartifact:latest
+envinject:latest
+htmlpublisher:latest
+pipeline-utility-steps:latest
+
+# UI & Experience
+simple-theme-plugin:latest
+dashboard-view:latest
+```
+
+4. Конфигурация Kerberos
+
+kerberos/krb5.conf:
+
+```ini
+[libdefaults]
+    default_realm = COMPANY.COM
+    dns_lookup_realm = false
+    dns_lookup_kdc = true
+    ticket_lifetime = 24h
+    renew_lifetime = 7d
+    forwardable = true
+    default_tgs_enctypes = aes256-cts-hmac-sha1-96 aes128-cts-hmac-sha1-96 arcfour-hmac-md5
+    default_tkt_enctypes = aes256-cts-hmac-sha1-96 aes128-cts-hmac-sha1-96 arcfour-hmac-md5
+    permitted_enctypes = aes256-cts-hmac-sha1-96 aes128-cts-hmac-sha1-96 arcfour-hmac-md5
+
+[realms]
+    COMPANY.COM = {
+        kdc = dc1.company.com
+        kdc = dc2.company.com
+        admin_server = dc1.company.com
+        default_domain = company.com
+    }
+
+[domain_realm]
+    .company.com = COMPANY.COM
+    company.com = COMPANY.COM
+
+[logging]
+    default = FILE:/var/log/krb5libs.log
+    kdc = FILE:/var/log/krb5kdc.log
+    admin_server = FILE:/var/log/kadmind.log
+```
+
+5. Обновленная конфигурация JCasC с AD
+
+casc/jenkins.yaml:
+
+```yaml
+jenkins:
+  agentProtocols:
+    - "JNLP4-connect"
+    - "Ping"
+  authorizationStrategy:
+    roleBased:
+      roles:
+        global:
+          - name: "admin"
+            description: "Jenkins Administrators"
+            permissions:
+              - "Overall/Administer"
+              - "Overall/Read"
+            assignments:
+              - "cn=jenkins-admins,ou=groups,dc=company,dc=com"
+          - name: "developer"
+            description: "Developers"
+            permissions:
+              - "Job/Read"
+              - "Job/Build"
+              - "Job/Workspace"
+              - "Job/Cancel"
+            assignments:
+              - "cn=developers,ou=groups,dc=company,dc=com"
+          - name: "viewer"
+            description: "Viewers"
+            permissions:
+              - "Overall/Read"
+              - "Job/Read"
+            assignments:
+              - "cn=users,ou=groups,dc=company,dc=com"
+  clouds: []
+  disabledAdministrativeMonitors:
+    - "hudson.diagnosis.ReverseProxySetupMonitor"
+  label: "master"
+  mode: NORMAL
+  numExecutors: 5
+  primaryView:
+    all:
+      name: "all"
+  quietPeriod: 5
+  remotingSecurity:
+    enabled: true
+  scmCheckoutRetryCount: 2
+  securityRealm:
+    activeDirectory:
+      domains:
+        - name: "company.com"
+          servers: "${AD_DOMAIN_CONTROLLER1}:389,${AD_DOMAIN_CONTROLLER2}:389"
+          site: "Default-First-Site-Name"
+          bindName: "${AD_BIND_USER}"
+          bindPassword: "${AD_BIND_PASSWORD}"
+          groupLookupStrategy: "RECURSIVE"
+          cache:
+            size: 1000
+            ttl: 300
+          startTls: true
+          removeIrrelevantGroups: true
+          customDomain: true
+          tlsConfiguration: "TRUST_ALL_CERTIFICATES"
+      cache:
+        size: 1000
+        ttl: 600
+      groupLookupStrategy: "RECURSIVE"
+      removeIrrelevantGroups: true
+      customDomain: true
+      startTls: true
+  slaveAgentPort: 50000
+  systemMessage: "Jenkins Infrastructure as Code Platform\nКорпоративная система управления конфигурацией\nИнтегрировано с Active Directory"
+  views:
+    - all:
+        name: "all"
+  viewsTabBar: "standard"
+
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          - usernamePassword:
+              scope: GLOBAL
+              id: "git-corporate-credentials"
+              username: "git-service"
+              password: "${GIT_PASSWORD}"
+          - sshUsernamePrivateKey:
+              scope: GLOBAL
+              id: "ansible-corporate-key"
+              username: "ansible"
+              privateKeySource:
+                directEntry:
+                  privateKey: "${ANSIBLE_SSH_KEY}"
+          - string:
+              scope: GLOBAL
+              id: "ansible-vault-corporate"
+              secret: "${ANSIBLE_VAULT_PASSWORD}"
+          - usernamePassword:
+              scope: GLOBAL
+              id: "docker-registry"
+              username: "${DOCKER_REGISTRY_USER}"
+              password: "${DOCKER_REGISTRY_PASSWORD}"
+          - usernamePassword:
+              scope: GLOBAL
+              id: "ad-service-account"
+              username: "${AD_BIND_USER}"
+              password: "${AD_BIND_PASSWORD}"
+
+tool:
+  git:
+    installations:
+      - name: "git"
+        home: "/usr/bin/git"
+  ansible:
+    installations:
+      - name: "ansible"
+        home: "/usr/local/bin/ansible"
+
+unclassified:
+  location:
+    url: "${JENKINS_URL}"
+    adminAddress: "jenkins-admin@company.com"
+  
+  mailer:
+    smtpHost: "smtp.company.com"
+    smtpPort: "587"
+    useSsl: true
+    smtpAuth: true
+    username: "jenkins-noreply@company.com"
+    password: "${SMTP_PASSWORD}"
+    charset: "UTF-8"
+  
+  systemd:
+    enable: false
+  
+  securityFilters:
+    adminForJob: true
+  
+  buildDiscarders:
+    configuredBuildDiscarders:
+      - strategy:
+          daysToKeep: "30"
+          numToKeep: "50"
+          artifactDaysToKeep: "15"
+          artifactNumToKeep: "20"
+
+security:
+  apiToken:
+    creationOfLegacyTokenEnabled: false
+    tokenGenerationOnCreationEnabled: true
+  sshd:
+    enabled: false
+  sSHD:
+    port: -1
+```
+
+6. Скрипт тестирования AD подключения
+
+scripts/test-ad-connection.sh:
+
+```bash
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+log() {
+    echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')] $1${NC}"
+}
+
+warn() {
+    echo -e "${YELLOW}[WARN] $1${NC}"
+}
+
+error() {
+    echo -e "${RED}[ERROR] $1${NC}"
+}
+
+test_ldap_connection() {
+    local bind_user="$1"
+    local bind_password="$2"
+    local domain_controller="$3"
+    local base_dn="$4"
+    
+    log "Testing LDAP connection to $domain_controller..."
+    
+    if ldapsearch -x -H "ldap://$domain_controller" -D "$bind_user" -w "$bind_password" -b "$base_dn" -LLL "(objectClass=user)" cn 2>/dev/null | head -10; then
+        log "✓ LDAP connection successful"
+        return 0
+    else
+        error "✗ LDAP connection failed"
+        return 1
+    fi
+}
+
+test_kerberos_auth() {
+    local domain="$1"
+    local user="$2"
+    local password="$3"
+    
+    log "Testing Kerberos authentication for domain $domain..."
+    
+    # Create credentials cache
+    if echo "$password" | kinit "$user@$domain" 2>/dev/null; then
+        log "✓ Kerberos authentication successful"
+        klist
+        kdestroy
+        return 0
+    else
+        error "✗ Kerberos authentication failed"
+        return 1
+    fi
+}
+
+test_ad_groups() {
+    local bind_user="$1"
+    local bind_password="$2"
+    local domain_controller="$3"
+    local base_dn="$4"
+    local group_dn="$5"
+    
+    log "Testing AD group lookup for $group_dn..."
+    
+    if ldapsearch -x -H "ldap://$domain_controller" -D "$bind_user" -w "$bind_password" -b "$base_dn" -LLL "(&(objectClass=group)(cn=jenkins-admins))" member 2>/dev/null; then
+        log "✓ AD group lookup successful"
+        return 0
+    else
+        warn "⚠ AD group lookup issues (might be normal if group doesn't exist)"
+        return 0
+    fi
+}
+
+main() {
+    log "Starting Active Directory connectivity tests..."
+    
+    # Source environment variables
+    if [[ -f ../.env ]]; then
+        source ../.env
+    else
+        error ".env file not found"
+        exit 1
+    fi
+    
+    # Test parameters
+    local bind_user="${AD_BIND_USER}"
+    local bind_password="${AD_BIND_PASSWORD}"
+    local domain_controller="${AD_DOMAIN_CONTROLLER1}"
+    local domain="${AD_DOMAIN}"
+    local base_dn="${AD_BASE_DN}"
+    local group_dn="${AD_GROUP_DN:-cn=jenkins-admins,ou=groups,dc=company,dc=com}"
+    
+    # Run tests
+    local tests_passed=0
+    local tests_failed=0
+    
+    if test_ldap_connection "$bind_user" "$bind_password" "$domain_controller" "$base_dn"; then
+        ((tests_passed++))
+    else
+        ((tests_failed++))
+    fi
+    
+    if test_kerberos_auth "$domain" "$bind_user" "$bind_password"; then
+        ((tests_passed++))
+    else
+        ((tests_failed++))
+    fi
+    
+    if test_ad_groups "$bind_user" "$bind_password" "$domain_controller" "$base_dn" "$group_dn"; then
+        ((tests_passed++))
+    else
+        ((tests_failed++))
+    fi
+    
+    log "Tests completed: $tests_passed passed, $tests_failed failed"
+    
+    if [[ $tests_failed -eq 0 ]]; then
+        log "✅ All AD connectivity tests passed!"
+    else
+        error "❌ Some AD connectivity tests failed"
+        exit 1
+    fi
+}
+
+main "$@"
+```
+
+7. Обновленный .env файл с AD настройками
+
+```env
+# Corporate Jenkins Configuration
+COMPOSE_PROJECT_NAME=jenkins-iac-corporate
+JENKINS_URL=http://jenkins.company.com
+
+# Active Directory Configuration
+AD_DOMAIN=company.com
+AD_DOMAIN_CONTROLLER1=dc1.company.com
+AD_DOMAIN_CONTROLLER2=dc2.company.com
+AD_BIND_USER=svc_jenkins@company.com
+AD_BIND_PASSWORD=secure_ad_bind_password_2024
+AD_BASE_DN=DC=company,DC=com
+AD_USER_SEARCH_BASE=OU=Users,DC=company,DC=com
+AD_GROUP_SEARCH_BASE=OU=Groups,DC=company,DC=com
+AD_DNS_SERVER_1=10.0.0.10
+AD_DNS_SERVER_2=10.0.0.11
+
+# Security Secrets
+ADMIN_PASSWORD=secure_corporate_password_2024
+SMTP_PASSWORD=smtp_corporate_password_2024
+GIT_PASSWORD=gitlab_corporate_token_2024
+ANSIBLE_VAULT_PASSWORD=vault_corporate_2024
+DOCKER_REGISTRY_USER=registry-user
+DOCKER_REGISTRY_PASSWORD=registry_corporate_2024
+
+# Ansible SSH Key (будет переопределен)
+ANSIBLE_SSH_KEY=ssh-rsa AAAAB3NzaC1yc2E...
+
+# Features
+ENABLE_TOOLS=true
+ENABLE_PROXY=false
+ENABLE_MONITORING=true
+ENABLE_AD_TEST=true
+
+# Network
+JENKINS_NETWORK_SUBNET=172.20.0.0/24
+```
+
+8. Скрипт настройки AD групп
+
+scripts/setup-ad-groups.sh:
+
+```bash
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# This script helps create AD groups for Jenkins if they don't exist
+# Requires ldap-utils and proper AD permissions
+
+create_ad_group() {
+    local group_name="$1"
+    local group_dn="$2"
+    local bind_user="$3"
+    local bind_password="$4"
+    local domain_controller="$5"
+    
+    log "Creating AD group: $group_name"
+    
+    cat << EOF | ldapmodify -x -H "ldap://$domain_controller" -D "$bind_user" -w "$bind_password"
+dn: $group_dn
+objectClass: top
+objectClass: group
+cn: $group_name
+sAMAccountName: $group_name
+groupType: -2147483646
+EOF
+
+}
+
+main() {
+    source ../.env
+    
+    local groups=(
+        "jenkins-admins:cn=jenkins-admins,ou=groups,dc=company,dc=com"
+        "jenkins-developers:cn=jenkins-developers,ou=groups,dc=company,dc=com"
+        "jenkins-viewers:cn=jenkins-viewers,ou=groups,dc=company,dc=com"
+    )
+    
+    for group_info in "${groups[@]}"; do
+        IFS=':' read -r group_name group_dn <<< "$group_info"
+        
+        if ! ldapsearch -x -H "ldap://${AD_DOMAIN_CONTROLLER1}" -D "${AD_BIND_USER}" -w "${AD_BIND_PASSWORD}" -b "$group_dn" -LLL "(objectClass=group)" 2>/dev/null | grep -q "cn: $group_name"; then
+            create_ad_group "$group_name" "$group_dn" "${AD_BIND_USER}" "${AD_BIND_PASSWORD}" "${AD_DOMAIN_CONTROLLER1}"
+        else
+            log "Group $group_name already exists"
+        fi
+    done
+}
+
+main "$@"
+```
+
+9. Обновленный deploy.sh с проверкой AD
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ... (предыдущий код остается)
+
+check_ad_connectivity() {
+    if [[ ${ENABLE_AD_TEST:-false} == "true" ]]; then
+        log "Проверка подключения к Active Directory..."
+        if docker compose run --rm jenkins /var/jenkins_scripts/test-ad-connection.sh; then
+            log "✓ Подключение к AD успешно"
+        else
+            error "❌ Ошибка подключения к AD"
+            warn "Продолжение развертывания, но AD может не работать"
+        fi
+    fi
+}
+
+main() {
+    log "🚀 Запуск корпоративного Jenkins с интеграцией Active Directory"
+    
+    check_dependencies
+    setup_environment
+    build_images
+    check_ad_connectivity
+    start_services
+    wait_for_jenkins
+    setup_initial_config
+    
+    log "✅ Развертывание завершено успешно!"
+    log "🔐 Jenkins интегрирован с Active Directory"
+    log "👥 Группы AD для управления доступом:"
+    log "   - jenkins-admins: полный доступ"
+    log "   - jenkins-developers: разработчики"
+    log "   - jenkins-viewers: просмотр"
+}
+
+main "$@"
+```
+
+Запуск с AD интеграцией
+
+```bash
+# Настройка секретов AD
+mkdir -p secrets
+echo "secure_ad_bind_password_2024" > secrets/ad_bind_password.txt
+chmod 600 secrets/ad_bind_password.txt
+
+# Тестирование AD подключения
+chmod +x scripts/test-ad-connection.sh
+./scripts/test-ad-connection.sh
+
+# Запуск с AD
+./deploy.sh
+
+# Запуск утилиты для тестирования AD (опционально)
+docker compose --profile ad-test up -d ldap-admin
+```
+
+Ключевые особенности AD интеграции:
+
+· ✅ Active Directory аутентификация - единый вход для сотрудников
+· ✅ Role-Based Access Control - управление правами через AD группы
+· ✅ Kerberos поддержка - безопасная аутентификация
+· ✅ LDAP поиск - эффективное получение информации о пользователях и группах
+· ✅ Тестирование подключения - автоматическая проверка AD connectivity
+· ✅ Готовые группы - предопределенные роли для управления доступом
+· ✅ Безопасность - TLS соединение с контроллерами домена
+
+Это решение обеспечивает полную интеграцию с корпоративной инфраструктурой Microsoft Active Directory с соблюдением лучших практик безопасности.

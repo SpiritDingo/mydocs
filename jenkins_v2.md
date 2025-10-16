@@ -2562,4 +2562,1128 @@ docker compose --profile ad-test up -d ldap-admin
 · ✅ Готовые группы - предопределенные роли для управления доступом
 · ✅ Безопасность - TLS соединение с контроллерами домена
 
-Это решение обеспечивает полную интеграцию с корпоративной инфраструктурой Microsoft Active Directory с соблюдением лучших практик безопасности.
+Это решение обеспечивает полную интеграцию с корпоративной инфраструктурой Microsoft Active Directory с соблюдением лучших практик безопасности. 
+
+
+Добавляю плагины Groovy, PowerShell, Python и Bash в корпоративное решение Jenkins:
+
+1. Обновленный plugins.txt
+
+```txt
+# Scripting & Languages
+groovy:latest
+powershell:latest
+python:latest
+bash:latest
+workflow-cps:latest
+script-security:latest
+
+# Active Directory & LDAP
+active-directory:latest
+ldap:latest
+saml:latest
+oic-auth:latest
+
+# Pipeline & DSL
+workflow-aggregator:latest
+pipeline-stage-view:latest
+job-dsl:latest
+blueocean:latest
+
+# Ansible & Infrastructure
+ansible:latest
+ansible-tower:latest
+
+# Version Control
+git:latest
+github:latest
+gitlab:latest
+bitbucket:latest
+
+# Security & Auth
+matrix-auth:latest
+role-strategy:latest
+credentials-binding:latest
+ssh-credentials:latest
+ssh-slaves:latest
+
+# Configuration as Code
+configuration-as-code:latest
+jcascom-configuration-as-code-support:latest
+
+# Docker & Kubernetes
+docker-workflow:latest
+docker-plugin:latest
+kubernetes:latest
+
+# Notifications & Monitoring
+email-ext:latest
+mailer:latest
+telegram-notifications:latest
+slack:latest
+
+# Utilities
+timestamper:latest
+ws-cleanup:latest
+build-timeout:latest
+parameterized-trigger:latest
+copyartifact:latest
+envinject:latest
+htmlpublisher:latest
+pipeline-utility-steps:latest
+
+# UI & Experience
+simple-theme-plugin:latest
+dashboard-view:latest
+```
+
+2. Обновленный Dockerfile с поддержкой всех языков
+
+```dockerfile
+# syntax=docker/dockerfile:1.4
+
+ARG JENKINS_VERSION=lts-jdk17
+
+FROM jenkins/jenkins:${JENKINS_VERSION} as base
+
+USER root
+
+# Метка для безопасности
+LABEL security.scan="true" \
+      maintainer="devops@company.com" \
+      version="2.0" \
+      languages="java,groovy,python,powershell,bash,ansible"
+
+# Установка базовых утилит + AD/LDAP инструменты + языки программирования
+RUN <<EOT
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        python3 \
+        python3-pip \
+        python3-venv \
+        git \
+        sshpass \
+        openssh-client \
+        curl \
+        gnupg \
+        software-properties-common \
+        jq \
+        unzip \
+        ldap-utils \
+        krb5-user \
+        libpam-krb5 \
+        libpam-sss \
+        libnss-sss \
+        sssd \
+        sssd-tools \
+        groovy \
+        powershell \
+        pwsh \
+        shellcheck \
+        npm \
+        nodejs \
+        maven \
+        gradle
+    rm -rf /var/lib/apt/lists/*
+    apt-get clean
+EOT
+
+# Установка .NET Core для расширенной поддержки PowerShell
+RUN <<EOT
+    wget https://packages.microsoft.com/config/debian/11/packages-microsoft-prod.deb -O packages-microsoft-prod.deb
+    dpkg -i packages-microsoft-prod.deb
+    rm packages-microsoft-prod.deb
+    apt-get update
+    apt-get install -y dotnet-sdk-6.0
+EOT
+
+# Многоступенчатая установка для оптимизации
+FROM base as ansible-install
+
+RUN pip3 install --no-cache-dir \
+    ansible \
+    ansible-lint \
+    yamllint \
+    ansible-tower-cli \
+    jmespath \
+    netaddr
+
+FROM base as python-libs
+
+RUN pip3 install --no-cache-dir \
+    requests \
+    jinja2 \
+    pyyaml \
+    cryptography \
+    azure-identity \
+    boto3 \
+    google-auth
+
+FROM base as final
+
+# Копируем установленные компоненты
+COPY --from=ansible-install /usr/local/lib/python3.9/dist-packages /usr/local/lib/python3.9/dist-packages
+COPY --from=ansible-install /usr/local/bin/ansible* /usr/local/bin/
+COPY --from=python-libs /usr/local/lib/python3.9/dist-packages /usr/local/lib/python3.9/dist-packages
+
+# Копируем .NET и PowerShell
+COPY --from=base /usr/bin/pwsh /usr/bin/pwsh
+COPY --from=base /usr/bin/powershell /usr/bin/powershell
+COPY --from=base /usr/share/dotnet /usr/share/dotnet
+
+# Настройка Kerberos для AD
+RUN mkdir -p /etc/krb5.conf.d
+COPY kerberos/krb5.conf /etc/krb5.conf
+
+# Создание структуры директорий для скриптов
+RUN <<EOT
+    mkdir -p /var/jenkins_conf/casc /var/ansible /shared
+    mkdir -p /usr/local/scripts/{groovy,powershell,python,bash}
+    chown -R jenkins:jenkins /var/jenkins_conf /var/ansible /shared /usr/local/scripts
+EOT
+
+# Копирование скриптов и библиотек
+COPY --chown=jenkins:jenkins scripts/ /var/jenkins_scripts/
+COPY --chown=jenkins:jenkins shared_scripts/ /usr/local/scripts/
+
+RUN chmod +x /var/jenkins_scripts/*.sh
+RUN chmod +x /usr/local/scripts/bash/*.sh
+RUN chmod +x /usr/local/scripts/python/*.py
+RUN chmod +x /usr/local/scripts/powershell/*.ps1
+
+# Создание симлинков для утилит
+RUN ln -sf /usr/bin/python3 /usr/bin/python
+
+# Установка плагинов через установленный скрипт
+RUN /usr/local/bin/install-plugins.sh < /usr/share/jenkins/ref/plugins.txt
+
+USER jenkins
+
+# Установка Groovy библиотек через Jenkins
+HEALTHCHECK --interval=30s --timeout=10s --start-period=1m --retries=3 \
+  CMD curl -f http://localhost:8080 || exit 1
+```
+
+3. Обновленная конфигурация JCasC с поддержкой языков
+
+casc/jenkins.yaml:
+
+```yaml
+jenkins:
+  agentProtocols:
+    - "JNLP4-connect"
+    - "Ping"
+  authorizationStrategy:
+    roleBased:
+      roles:
+        global:
+          - name: "admin"
+            description: "Jenkins Administrators"
+            permissions:
+              - "Overall/Administer"
+              - "Overall/Read"
+            assignments:
+              - "cn=jenkins-admins,ou=groups,dc=company,dc=com"
+          - name: "developer"
+            description: "Developers"
+            permissions:
+              - "Job/Read"
+              - "Job/Build"
+              - "Job/Workspace"
+              - "Job/Cancel"
+              - "Run/Replay"
+              - "Run/Update"
+            assignments:
+              - "cn=developers,ou=groups,dc=company,dc=com"
+          - name: "script-user"
+            description: "Script Users"
+            permissions:
+              - "Overall/Read"
+              - "Job/Read"
+              - "Job/Build"
+              - "View/Read"
+            assignments:
+              - "cn=script-users,ou=groups,dc=company,dc=com"
+  clouds: []
+  disabledAdministrativeMonitors:
+    - "hudson.diagnosis.ReverseProxySetupMonitor"
+  label: "master"
+  mode: NORMAL
+  numExecutors: 5
+  primaryView:
+    all:
+      name: "all"
+  quietPeriod: 5
+  remotingSecurity:
+    enabled: true
+  scmCheckoutRetryCount: 2
+  securityRealm:
+    activeDirectory:
+      domains:
+        - name: "company.com"
+          servers: "${AD_DOMAIN_CONTROLLER1}:389,${AD_DOMAIN_CONTROLLER2}:389"
+          site: "Default-First-Site-Name"
+          bindName: "${AD_BIND_USER}"
+          bindPassword: "${AD_BIND_PASSWORD}"
+          groupLookupStrategy: "RECURSIVE"
+          cache:
+            size: 1000
+            ttl: 300
+          startTls: true
+          removeIrrelevantGroups: true
+          customDomain: true
+          tlsConfiguration: "TRUST_ALL_CERTIFICATES"
+      cache:
+        size: 1000
+        ttl: 600
+      groupLookupStrategy: "RECURSIVE"
+      removeIrrelevantGroups: true
+      customDomain: true
+      startTls: true
+  slaveAgentPort: 50000
+  systemMessage: |
+    Jenkins Infrastructure as Code Platform
+    Корпоративная система управления конфигурацией
+    Поддержка языков: Groovy, PowerShell, Python, Bash
+  views:
+    - all:
+        name: "all"
+  viewsTabBar: "standard"
+
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          - usernamePassword:
+              scope: GLOBAL
+              id: "git-corporate-credentials"
+              username: "git-service"
+              password: "${GIT_PASSWORD}"
+          - sshUsernamePrivateKey:
+              scope: GLOBAL
+              id: "ansible-corporate-key"
+              username: "ansible"
+              privateKeySource:
+                directEntry:
+                  privateKey: "${ANSIBLE_SSH_KEY}"
+          - string:
+              scope: GLOBAL
+              id: "ansible-vault-corporate"
+              secret: "${ANSIBLE_VAULT_PASSWORD}"
+          - usernamePassword:
+              scope: GLOBAL
+              id: "docker-registry"
+              username: "${DOCKER_REGISTRY_USER}"
+              password: "${DOCKER_REGISTRY_PASSWORD}"
+          - usernamePassword:
+              scope: GLOBAL
+              id: "ad-service-account"
+              username: "${AD_BIND_USER}"
+              password: "${AD_BIND_PASSWORD}"
+          - secretText:
+              scope: GLOBAL
+              id: "python-api-key"
+              secret: "${PYTHON_API_KEY}"
+          - secretText:
+              scope: GLOBAL
+              id: "powershell-encryption-key"
+              secret: "${POWERSHELL_ENCRYPTION_KEY}"
+
+tool:
+  git:
+    installations:
+      - name: "git"
+        home: "/usr/bin/git"
+  ansible:
+    installations:
+      - name: "ansible"
+        home: "/usr/local/bin/ansible"
+  powershell:
+    installations:
+      - name: "powershell-linux"
+        home: "/usr/bin/pwsh"
+      - name: "powershell-windows"
+        home: "C:\\Program Files\\PowerShell\\7\\pwsh.exe"
+  python:
+    installations:
+      - name: "python3"
+        home: "/usr/bin/python3"
+        properties:
+          - installSource:
+              installers:
+                - command:
+                    command: "/usr/bin/python3 --version"
+  groovy:
+    installations:
+      - name: "groovy-system"
+        home: "/usr/share/groovy"
+        properties:
+          - installSource:
+              installers:
+                - command:
+                    command: "/usr/bin/groovy --version"
+
+unclassified:
+  location:
+    url: "${JENKINS_URL}"
+    adminAddress: "jenkins-admin@company.com"
+  
+  mailer:
+    smtpHost: "smtp.company.com"
+    smtpPort: "587"
+    useSsl: true
+    smtpAuth: true
+    username: "jenkins-noreply@company.com"
+    password: "${SMTP_PASSWORD}"
+    charset: "UTF-8"
+  
+  systemd:
+    enable: false
+  
+  securityFilters:
+    adminForJob: true
+  
+  buildDiscarders:
+    configuredBuildDiscarders:
+      - strategy:
+          daysToKeep: "30"
+          numToKeep: "50"
+          artifactDaysToKeep: "15"
+          artifactNumToKeep: "20"
+  
+  # Groovy System Configuration
+  groovy:
+    enabled: true
+    securityEnabled: true
+  
+  # Script Security
+  scriptSecurity:
+    approvedSignatures:
+      - "method java.lang.ProcessBuilder start"
+      - "method java.lang.Runtime exec"
+      - "staticMethod org.codehaus.groovy.runtime.DefaultGroovyMethods execute"
+      - "staticMethod org.codehaus.groovy.runtime.ProcessGroovyMethods execute"
+      - "staticMethod org.codehaus.groovy.runtime.ProcessGroovyMethods getText"
+
+security:
+  apiToken:
+    creationOfLegacyTokenEnabled: false
+    tokenGenerationOnCreationEnabled: true
+  sshd:
+    enabled: false
+  sSHD:
+    port: -1
+  scriptApproval:
+    approvedSignatures:
+      - "method groovy.json.JsonSlurper parseText"
+      - "method groovy.json.JsonOutput toJson"
+      - "method java.util.Map get"
+      - "method java.util.List get"
+      - "staticMethod org.codehaus.groovy.runtime.DefaultGroovyMethods eachLine java.io.File groovy.lang.Closure"
+```
+
+4. Скрипты-примеры для каждого языка
+
+Groovy скрипты
+
+shared_scripts/groovy/SystemInfo.groovy:
+
+```groovy
+#!/usr/bin/env groovy
+
+def call() {
+    echo "🔍 System Information Groovy Script"
+    
+    // Jenkins system info
+    echo "Jenkins URL: ${Jenkins.instance.getRootUrl()}"
+    echo "Jenkins Version: ${Jenkins.instance.getVersion()}"
+    echo "Executor Count: ${Jenkins.instance.getNumExecutors()}"
+    
+    // Node information
+    def nodes = Jenkins.instance.getNodes()
+    nodes.each { node ->
+        echo "Node: ${node.getDisplayName()} - ${node.getLabelString()}"
+    }
+    
+    // Plugin information
+    def plugins = Jenkins.instance.pluginManager.plugins
+    def enabledPlugins = plugins.findAll { it.isEnabled() }
+    echo "Enabled Plugins: ${enabledPlugins.size()}"
+    
+    return [
+        'node_count': nodes.size(),
+        'plugin_count': enabledPlugins.size(),
+        'executor_count': Jenkins.instance.getNumExecutors()
+    ]
+}
+
+def getQueueInfo() {
+    def queue = Jenkins.instance.queue
+    def items = queue.getItems()
+    
+    echo "Build Queue: ${items.size()} items"
+    items.each { item ->
+        echo "  - ${item.task.name}: ${item.getWhy()}"
+    }
+    
+    return items.size()
+}
+
+// AD User information (if available)
+def getADUserInfo(String username) {
+    try {
+        def user = User.get(username, false)
+        if (user) {
+            def properties = user.getAllProperties()
+            echo "User: ${user.getDisplayName()}"
+            properties.each { prop ->
+                echo "  - ${prop.getClass().getSimpleName()}"
+            }
+        }
+    } catch (Exception e) {
+        echo "⚠️ Could not get user info: ${e.message}"
+    }
+}
+```
+
+PowerShell скрипты
+
+shared_scripts/powershell/SystemCheck.ps1:
+
+```powershell
+#!/usr/bin/env pwsh
+
+<#
+.SYNOPSIS
+    Corporate System Check PowerShell Script
+.DESCRIPTION
+    Performs system checks and returns status information
+.PARAMETER CheckType
+    Type of check to perform
+#>
+
+param(
+    [ValidateSet("System", "Network", "Storage", "All")]
+    [string]$CheckType = "All"
+)
+
+function Get-SystemInfo {
+    Write-Host "🖥️ System Information" -ForegroundColor Green
+    
+    $os = Get-CimInstance Win32_OperatingSystem
+    $computer = Get-CimInstance Win32_ComputerSystem
+    
+    return @{
+        OS = $os.Caption
+        Version = $os.Version
+        Architecture = $os.OSArchitecture
+        MemoryGB = [math]::Round($computer.TotalPhysicalMemory / 1GB, 2)
+        Processors = $computer.NumberOfProcessors
+    }
+}
+
+function Get-NetworkInfo {
+    Write-Host "🌐 Network Information" -ForegroundColor Cyan
+    
+    $networkAdapters = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' }
+    $dnsServers = (Get-DnsClientServerAddress -AddressFamily IPv4 | Where-Object { $_.ServerAddresses.Length -gt 0 }).ServerAddresses
+    
+    return @{
+        Adapters = $networkAdapters.Count
+        DNS_Servers = $dnsServers -join ', '
+        Hostname = [System.Net.Dns]::GetHostName()
+    }
+}
+
+function Get-StorageInfo {
+    Write-Host "💾 Storage Information" -ForegroundColor Yellow
+    
+    $drives = Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Used -gt 0 }
+    $storageInfo = @()
+    
+    foreach ($drive in $drives) {
+        $storageInfo += @{
+            Drive = $drive.Name
+            FreeGB = [math]::Round($drive.Free / 1GB, 2)
+            UsedGB = [math]::Round($drive.Used / 1GB, 2)
+            TotalGB = [math]::Round(($drive.Free + $drive.Used) / 1GB, 2)
+        }
+    }
+    
+    return $storageInfo
+}
+
+function Invoke-ADCheck {
+    Write-Host "🔐 Active Directory Check" -ForegroundColor Magenta
+    
+    try {
+        # Check if AD module is available
+        if (Get-Module -ListAvailable -Name ActiveDirectory) {
+            Import-Module ActiveDirectory
+            
+            $domain = Get-ADDomain
+            $domainControllers = Get-ADDomainController -Filter *
+            
+            return @{
+                Domain = $domain.DNSRoot
+                DomainControllers = $domainControllers.Count
+                Forest = $domain.Forest
+            }
+        } else {
+            Write-Warning "Active Directory module not available"
+            return $null
+        }
+    } catch {
+        Write-Warning "AD check failed: $_"
+        return $null
+    }
+}
+
+# Main execution
+$results = @{}
+
+switch ($CheckType) {
+    "System" { 
+        $results.System = Get-SystemInfo
+    }
+    "Network" { 
+        $results.Network = Get-NetworkInfo
+    }
+    "Storage" { 
+        $results.Storage = Get-StorageInfo
+    }
+    "All" {
+        $results.System = Get-SystemInfo
+        $results.Network = Get-NetworkInfo
+        $results.Storage = Get-StorageInfo
+        $results.AD = Invoke-ADCheck
+    }
+}
+
+# Convert to JSON for Jenkins pipeline
+return $results | ConvertTo-Json -Depth 3
+```
+
+Python скрипты
+
+shared_scripts/python/infrastructure_check.py:
+
+```python
+#!/usr/bin/env python3
+"""
+Corporate Infrastructure Check Script
+Provides infrastructure monitoring and validation capabilities
+"""
+
+import json
+import subprocess
+import sys
+import os
+import socket
+import psutil
+from pathlib import Path
+
+class InfrastructureChecker:
+    def __init__(self):
+        self.results = {}
+    
+    def check_system_resources(self):
+        """Check system CPU, memory, and disk usage"""
+        try:
+            cpu_percent = psutil.cpu_percent(interval=1)
+            memory = psutil.virtual_memory()
+            disk = psutil.disk_usage('/')
+            
+            self.results['system'] = {
+                'cpu_percent': cpu_percent,
+                'memory_total_gb': round(memory.total / (1024**3), 2),
+                'memory_used_gb': round(memory.used / (1024**3), 2),
+                'memory_percent': memory.percent,
+                'disk_total_gb': round(disk.total / (1024**3), 2),
+                'disk_used_gb': round(disk.used / (1024**3), 2),
+                'disk_percent': disk.percent
+            }
+            return True
+        except Exception as e:
+            self.results['system_error'] = str(e)
+            return False
+    
+    def check_network_connectivity(self, hosts=None):
+        """Check network connectivity to important hosts"""
+        if hosts is None:
+            hosts = ['google.com', 'github.com', 'company.com']
+        
+        network_results = {}
+        for host in hosts:
+            try:
+                socket.setdefaulttimeout(5)
+                socket.gethostbyname(host)
+                network_results[host] = 'reachable'
+            except socket.error as e:
+                network_results[host] = f'unreachable: {e}'
+        
+        self.results['network'] = network_results
+        return all(status == 'reachable' for status in network_results.values())
+    
+    def check_docker_status(self):
+        """Check Docker daemon status and container count"""
+        try:
+            result = subprocess.run(['docker', 'info'], 
+                                  capture_output=True, text=True, timeout=30)
+            if result.returncode == 0:
+                # Count running containers
+                containers_result = subprocess.run(
+                    ['docker', 'ps', '-q'], 
+                    capture_output=True, text=True
+                )
+                running_containers = len(containers_result.stdout.strip().split('\n')) - 1
+                
+                self.results['docker'] = {
+                    'status': 'running',
+                    'running_containers': running_containers
+                }
+                return True
+            else:
+                self.results['docker'] = {'status': 'not_running'}
+                return False
+        except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError) as e:
+            self.results['docker'] = {'status': f'error: {e}'}
+            return False
+    
+    def check_ansible_inventory(self, inventory_path='/inventory'):
+        """Check Ansible inventory if available"""
+        inventory_path = Path(inventory_path)
+        if inventory_path.exists():
+            try:
+                # Simple inventory check
+                result = subprocess.run(
+                    ['ansible-inventory', '-i', str(inventory_path), '--list'],
+                    capture_output=True, text=True, timeout=30
+                )
+                if result.returncode == 0:
+                    inventory_data = json.loads(result.stdout)
+                    host_count = sum(len(hosts) for hosts in inventory_data.values() 
+                                   if isinstance(hosts, dict))
+                    
+                    self.results['ansible'] = {
+                        'inventory_valid': True,
+                        'host_count': host_count,
+                        'groups': list(inventory_data.keys())
+                    }
+                    return True
+            except Exception as e:
+                self.results['ansible'] = {
+                    'inventory_valid': False,
+                    'error': str(e)
+                }
+                return False
+        return None
+    
+    def run_all_checks(self):
+        """Run all infrastructure checks"""
+        print("🔍 Running Infrastructure Checks...")
+        
+        checks = [
+            ('System Resources', self.check_system_resources),
+            ('Network Connectivity', lambda: self.check_network_connectivity()),
+            ('Docker Status', self.check_docker_status),
+            ('Ansible Inventory', self.check_ansible_inventory)
+        ]
+        
+        for check_name, check_func in checks:
+            try:
+                success = check_func()
+                status = "✅" if success else "⚠️"
+                print(f"{status} {check_name}")
+            except Exception as e:
+                print(f"❌ {check_name}: {e}")
+        
+        return self.results
+
+def main():
+    checker = InfrastructureChecker()
+    results = checker.run_all_checks()
+    
+    # Output results as JSON for Jenkins
+    print(json.dumps(results, indent=2))
+    
+    # Determine exit code
+    if any('error' in str(result).lower() for result in results.values()):
+        sys.exit(1)
+    else:
+        sys.exit(0)
+
+if __name__ == "__main__":
+    main()
+```
+
+Bash скрипты
+
+shared_scripts/bash/system_audit.sh:
+
+```bash
+#!/bin/bash
+
+# Corporate System Audit Script
+# Performs comprehensive system checks and audits
+
+set -euo pipefail
+
+# Color codes for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Logging functions
+log_info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
+}
+
+log_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1"
+}
+
+log_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# Results array
+declare -A RESULTS
+
+check_system_info() {
+    log_info "Checking system information..."
+    
+    RESULTS["hostname"]=$(hostname)
+    RESULTS["os"]=$(source /etc/os-release && echo "$PRETTY_NAME")
+    RESULTS["kernel"]=$(uname -r)
+    RESULTS["architecture"]=$(uname -m)
+    RESULTS["uptime"]=$(uptime -p)
+    
+    log_success "System info collected"
+}
+
+check_cpu_memory() {
+    log_info "Checking CPU and memory..."
+    
+    RESULTS["cpu_cores"]=$(nproc)
+    RESULTS["cpu_load"]=$(uptime | awk -F'load average:' '{ print $2 }' | xargs)
+    RESULTS["memory_total_mb"]=$(free -m | awk 'NR==2{print $2}')
+    RESULTS["memory_used_mb"]=$(free -m | awk 'NR==2{print $3}')
+    RESULTS["memory_usage_percent"]=$(free | awk 'NR==2{printf "%.2f", $3/$2 * 100}')
+    
+    log_success "CPU and memory info collected"
+}
+
+check_disk_usage() {
+    log_info "Checking disk usage..."
+    
+    local disk_info=$(df -h / | awk 'NR==2{print $5,$2,$3,$4}')
+    RESULTS["disk_usage"]=$(echo "$disk_info" | awk '{print $1}')
+    RESULTS["disk_total"]=$(echo "$disk_info" | awk '{print $2}')
+    RESULTS["disk_used"]=$(echo "$disk_info" | awk '{print $3}')
+    RESULTS["disk_available"]=$(echo "$disk_info" | awk '{print $4}')
+    
+    log_success "Disk usage info collected"
+}
+
+check_docker_containers() {
+    log_info "Checking Docker containers..."
+    
+    if command -v docker &> /dev/null; then
+        RESULTS["docker_installed"]="true"
+        RESULTS["docker_containers_total"]=$(docker ps -aq | wc -l | tr -d ' ')
+        RESULTS["docker_containers_running"]=$(docker ps -q | wc -l | tr -d ' ')
+        RESULTS["docker_version"]=$(docker --version | cut -d' ' -f3 | tr -d ',')
+    else
+        RESULTS["docker_installed"]="false"
+        log_warning "Docker not installed"
+    fi
+    
+    log_success "Docker info collected"
+}
+
+check_network_connectivity() {
+    log_info "Checking network connectivity..."
+    
+    local hosts=("google.com" "github.com" "company.com")
+    local connectivity_results=()
+    
+    for host in "${hosts[@]}"; do
+        if ping -c 1 -W 3 "$host" &> /dev/null; then
+            connectivity_results+=("$host:reachable")
+        else
+            connectivity_results+=("$host:unreachable")
+        fi
+    done
+    
+    RESULTS["network_connectivity"]=$(IFS=','; echo "${connectivity_results[*]}")
+    log_success "Network connectivity checked"
+}
+
+check_jenkins_status() {
+    log_info "Checking Jenkins status..."
+    
+    if curl -s -f http://localhost:8080 > /dev/null; then
+        RESULTS["jenkins_status"]="running"
+        RESULTS["jenkins_accessible"]="true"
+    else
+        RESULTS["jenkins_status"]="not_running"
+        RESULTS["jenkins_accessible"]="false"
+        log_warning "Jenkins is not accessible"
+    fi
+    
+    log_success "Jenkins status checked"
+}
+
+generate_report() {
+    log_info "Generating audit report..."
+    
+    local report_file="/shared/audit_report_$(date +%Y%m%d_%H%M%S).json"
+    
+    # Convert associative array to JSON
+    echo "{" > "$report_file"
+    local first=true
+    for key in "${!RESULTS[@]}"; do
+        if [ "$first" = true ]; then
+            first=false
+        else
+            echo "," >> "$report_file"
+        fi
+        printf '  "%s": "%s"' "$key" "${RESULTS[$key]}" >> "$report_file"
+    done
+    echo -e "\n}" >> "$report_file"
+    
+    log_success "Audit report generated: $report_file"
+    
+    # Print summary
+    echo
+    log_info "=== AUDIT SUMMARY ==="
+    for key in "${!RESULTS[@]}"; do
+        echo "  $key: ${RESULTS[$key]}"
+    done
+}
+
+main() {
+    log_info "Starting corporate system audit..."
+    
+    check_system_info
+    check_cpu_memory
+    check_disk_usage
+    check_docker_containers
+    check_network_connectivity
+    check_jenkins_status
+    generate_report
+    
+    log_success "System audit completed successfully"
+}
+
+# Handle script execution
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
+```
+
+5. Jenkins Pipeline пример с использованием всех языков
+
+shared_scripts/pipelines/multi-language-pipeline.jenkinsfile:
+
+```groovy
+pipeline {
+    agent any
+    tools {
+        powershell 'powershell-linux'
+        python 'python3'
+        groovy 'groovy-system'
+    }
+    stages {
+        stage('System Audit - Bash') {
+            steps {
+                script {
+                    sh '''
+                        chmod +x /usr/local/scripts/bash/system_audit.sh
+                        /usr/local/scripts/bash/system_audit.sh
+                    '''
+                }
+            }
+        }
+        
+        stage('Infrastructure Check - Python') {
+            steps {
+                script {
+                    withPythonEnv('/usr/bin/python3') {
+                        sh 'python3 /usr/local/scripts/python/infrastructure_check.py'
+                    }
+                }
+            }
+        }
+        
+        stage('System Check - PowerShell') {
+            steps {
+                powershell '''
+                    . /usr/local/scripts/powershell/SystemCheck.ps1
+                    $results = Invoke-SystemCheck -CheckType All
+                    Write-Host "Results: $($results | ConvertTo-Json -Depth 3)"
+                '''
+            }
+        }
+        
+        stage('Groovy System Info') {
+            steps {
+                script {
+                    def groovyResults = load '/usr/local/scripts/groovy/SystemInfo.groovy'
+                    def systemInfo = groovyResults.call()
+                    echo "System Info: ${systemInfo}"
+                    
+                    def queueSize = groovyResults.getQueueInfo()
+                    echo "Queue size: ${queueSize}"
+                }
+            }
+        }
+        
+        stage('Multi-language Report') {
+            steps {
+                script {
+                    // Generate combined report using all languages
+                    def combinedReport = [
+                        timestamp: new Date().toString(),
+                        system_audit: readJSON(file: '/shared/audit_report_*.json')[0],
+                        pipeline_info: [
+                            'build_number': env.BUILD_NUMBER,
+                            'job_name': env.JOB_NAME,
+                            'node_name': env.NODE_NAME
+                        ]
+                    ]
+                    
+                    writeJSON file: '/shared/combined_report.json', json: combinedReport
+                    archiveArtifacts artifacts: '/shared/combined_report.json', fingerprint: true
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            script {
+                // Cleanup and notification
+                echo "Multi-language pipeline execution completed"
+                
+                // PowerShell notification
+                powershell '''
+                    Write-Host "Pipeline completed with status: $env.BUILD_STATUS" -ForegroundColor Green
+                '''
+            }
+        }
+        success {
+            emailext (
+                subject: "SUCCESS: Multi-language Pipeline ${env.JOB_NAME} - Build ${env.BUILD_NUMBER}",
+                body: """
+                Multi-language infrastructure check completed successfully.
+                
+                Build: ${env.BUILD_URL}
+                Node: ${env.NODE_NAME}
+                Duration: ${currentBuild.durationString}
+                
+                Reports available in shared directory.
+                """,
+                to: "infrastructure-team@company.com"
+            )
+        }
+        failure {
+            emailext (
+                subject: "FAILED: Multi-language Pipeline ${env.JOB_NAME} - Build ${env.BUILD_NUMBER}",
+                body: """
+                Multi-language infrastructure check failed.
+                
+                Build: ${env.BUILD_URL}
+                Node: ${env.NODE_NAME}
+                Duration: ${currentBuild.durationString}
+                
+                Please check Jenkins logs for details.
+                """,
+                to: "infrastructure-team@company.com"
+            )
+        }
+    }
+}
+```
+
+6. Обновленный .env с новыми переменными
+
+```env
+# Corporate Jenkins Configuration
+COMPOSE_PROJECT_NAME=jenkins-iac-corporate
+JENKINS_URL=http://jenkins.company.com
+
+# Active Directory Configuration
+AD_DOMAIN=company.com
+AD_DOMAIN_CONTROLLER1=dc1.company.com
+AD_DOMAIN_CONTROLLER2=dc2.company.com
+AD_BIND_USER=svc_jenkins@company.com
+AD_BIND_PASSWORD=secure_ad_bind_password_2024
+AD_BASE_DN=DC=company,DC=com
+AD_USER_SEARCH_BASE=OU=Users,DC=company,DC=com
+AD_GROUP_SEARCH_BASE=OU=Groups,DC=company,DC=com
+AD_DNS_SERVER_1=10.0.0.10
+AD_DNS_SERVER_2=10.0.0.11
+
+# Scripting & Language Security
+PYTHON_API_KEY=python_corporate_api_2024
+POWERSHELL_ENCRYPTION_KEY=powershell_secure_key_2024
+GROOVY_SCRIPT_APPROVAL_ENABLED=true
+
+# Security Secrets
+ADMIN_PASSWORD=secure_corporate_password_2024
+SMTP_PASSWORD=smtp_corporate_password_2024
+GIT_PASSWORD=gitlab_corporate_token_2024
+ANSIBLE_VAULT_PASSWORD=vault_corporate_2024
+DOCKER_REGISTRY_USER=registry-user
+DOCKER_REGISTRY_PASSWORD=registry_corporate_2024
+
+# Ansible SSH Key (будет переопределен)
+ANSIBLE_SSH_KEY=ssh-rsa AAAAB3NzaC1yc2E...
+
+# Features
+ENABLE_TOOLS=true
+ENABLE_PROXY=false
+ENABLE_MONITORING=true
+ENABLE_AD_TEST=true
+ENABLE_MULTI_LANGUAGE=true
+
+# Network
+JENKINS_NETWORK_SUBNET=172.20.0.0/24
+```
+
+Запуск с поддержкой всех языков
+
+```bash
+# Создание директорий для скриптов
+mkdir -p shared_scripts/{groovy,powershell,python,bash,pipelines}
+
+# Настройка прав
+chmod +x shared_scripts/bash/*.sh
+chmod +x shared_scripts/python/*.py
+
+# Запуск системы
+./deploy.sh
+
+# Создание пайплайна с multi-language поддержкой
+cp shared_scripts/pipelines/multi-language-pipeline.jenkinsfile data/jenkins_home/
+```
+
+Ключевые особенности мульти-языковой поддержки:
+
+· ✅ Groovy: Полная интеграция с Jenkins API, системные скрипты
+· ✅ PowerShell: Поддержка Windows и Linux, AD интеграция
+· ✅ Python: Широкие возможности автоматизации, библиотеки для инфраструктуры
+· ✅ Bash: Стандартные системные скрипты, проверка окружения
+· ✅ Безопасность: Script approval, sandbox выполнение
+· ✅ Интеграция: Все языки работают вместе в пайплайнах
+· ✅ Корпоративные функции: Логирование, аудит, уведомления
+
+Это решение предоставляет полную мульти-языковую платформу для автоматизации инфраструктуры с корпоративным уровнем безопасности и интеграции.

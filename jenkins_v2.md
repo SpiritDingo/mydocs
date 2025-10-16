@@ -3687,3 +3687,212 @@ cp shared_scripts/pipelines/multi-language-pipeline.jenkinsfile data/jenkins_hom
 · ✅ Корпоративные функции: Логирование, аудит, уведомления
 
 Это решение предоставляет полную мульти-языковую платформу для автоматизации инфраструктуры с корпоративным уровнем безопасности и интеграции.
+
+
+Обновленная структура проекта Jenkins Infrastructure as Code
+
+```
+jenkins-iac-corporate/
+├── 🐋 Docker & Compose файлы
+│   ├── docker-compose.yml                 # Основной compose файл
+│   ├── Dockerfile                         # Кастомный образ Jenkins с языками
+│   └── .dockerignore                      # Исключения для Docker
+├── ⚙️ Конфигурация Jenkins
+│   ├── casc/
+│   │   └── jenkins.yaml                   # Configuration-as-Code
+│   ├── kerberos/
+│   │   └── krb5.conf                      # Конфигурация Kerberos для AD
+│   └── plugins.txt                        # Список плагинов
+├── 🔐 Секреты и переменные
+│   ├── .env                               # Переменные окружения (не в git)
+│   ├── .env.example                       # Пример переменных
+│   ├── secrets/                           # Файлы с секретами
+│   │   ├── jenkins_admin_password.txt
+│   │   ├── smtp_password.txt
+│   │   ├── ad_bind_password.txt
+│   │   └── git_password.txt
+├── 📜 Скрипты управления
+│   ├── deploy.sh                          # Основной скрипт развертывания
+│   ├── scripts/
+│   │   ├── management.sh                  # Управление сервисами
+│   │   ├── test-ad-connection.sh          # Тест AD подключения
+│   │   ├── setup-ad-groups.sh             # Настройка AD групп
+│   │   └── install-plugins.sh             # Установка плагинов
+├── 💻 Мульти-языковые скрипты
+│   └── shared_scripts/
+│       ├── groovy/
+│       │   ├── SystemInfo.groovy          # Системная информация
+│       │   ├── UserManagement.groovy      # Управление пользователями
+│       │   └── PipelineUtils.groovy       # Утилиты для пайплайнов
+│       ├── powershell/
+│       │   ├── SystemCheck.ps1            # Проверка системы
+│       │   ├── ADManagement.ps1           # Управление AD
+│       │   └── NetworkTest.ps1            # Тесты сети
+│       ├── python/
+│       │   ├── infrastructure_check.py    # Проверка инфраструктуры
+│       │   ├── api_client.py              # Клиент для API
+│       │   └── security_scanner.py        # Сканер безопасности
+│       ├── bash/
+│       │   ├── system_audit.sh            # Аудит системы
+│       │   ├── docker_management.sh       # Управление Docker
+│       │   └── backup_scripts.sh          # Скрипты бэкапа
+│       └── pipelines/
+│           ├── multi-language-pipeline.jenkinsfile
+│           ├── ansible-deployment.jenkinsfile
+│           └── security-scan.jenkinsfile
+├── 🌐 Web прокси (опционально)
+│   └── nginx/
+│       ├── conf.d/
+│       │   └── jenkins.conf               # Конфиг nginx для Jenkins
+│       └── ssl/                           # SSL сертификаты
+│           ├── server.crt
+│           └── server.key
+├── 📁 Данные и вольюмы
+│   └── data/
+│       ├── jenkins_home/                  # Данные Jenkins
+│       │   ├── jobs/                      # Конфигурации jobs
+│       │   ├── plugins/                   # Установленные плагины
+│       │   ├── secrets/                   # Секреты Jenkins
+│       │   └── userContent/               # Пользовательский контент
+│       ├── ansible/                       # Ansible данные
+│       │   ├── inventory/                 # Инвентари
+│       │   ├── roles/                     # Ansible роли
+│       │   └── playbooks/                 # Плейбуки
+│       └── shared/                        # Общие данные
+│           ├── audit_reports/             # Отчеты аудита
+│           ├── logs/                      # Логи приложений
+│           └── temp/                      # Временные файлы
+├── 📚 Документация
+│   ├── README.md                          # Основная документация
+│   ├── AD_INTEGRATION.md                  # Интеграция с AD
+│   ├── MULTI_LANGUAGE_GUIDE.md            # Руководство по языкам
+│   └── API_REFERENCE.md                   # Справочник API
+└── 🧪 Тесты и валидация
+    ├── tests/
+    │   ├── test_ad_connectivity.sh        # Тесты AD
+    │   ├── test_plugins.sh                # Тесты плагинов
+    │   └── test_scripts.sh                # Тесты скриптов
+    └── validation/
+        ├── yaml_validator.py              # Валидатор YAML
+        └── security_check.sh              # Проверка безопасности
+```
+
+Детальное описание ключевых директорий:
+
+🐋 Docker & Compose
+
+· docker-compose.yml - Основная конфигурация всех сервисов
+· Dockerfile - Кастомный образ с поддержкой Groovy, PowerShell, Python, Bash, Ansible
+· .dockerignore - Исключает ненужные файлы при сборке
+
+⚙️ Конфигурация Jenkins
+
+· casc/jenkins.yaml - Полная конфигурация через код (AD, инструменты, безопасность)
+· kerberos/krb5.conf - Настройки Kerberos для интеграции с Active Directory
+· plugins.txt - Все необходимые плагины включая языковые и AD
+
+🔐 Секреты и безопасность
+
+· .env - Централизованные переменные окружения (исключен из git)
+· secrets/ - Файлы с паролями и ключами (исключены из git)
+· Разделение чувствительных данных от конфигурации
+
+💻 Мульти-языковая поддержка
+
+· shared_scripts/groovy/ - Скрипты для управления Jenkins API
+· shared_scripts/powershell/ - Скрипты для Windows/Linux систем
+· shared_scripts/python/ - Скрипты для автоматизации и API
+· shared_scripts/bash/ - Системные скрипты и утилиты
+· shared_scripts/pipelines/ - Готовые пайплайны Jenkins
+
+📁 Данные и персистентность
+
+· data/jenkins_home/ - Постоянное хранилище Jenkins
+· data/ansible/ - Ansible инвентари и плейбуки
+· data/shared/ - Общие данные между контейнерами
+
+🌐 Сеть и прокси
+
+· nginx/ - Конфигурация обратного прокси с SSL
+· Поддержка корпоративных proxy и TLS
+
+Файлы, исключенные из git (.gitignore):
+
+```gitignore
+# Секреты и чувствительные данные
+.env
+secrets/*.txt
+secrets/*.key
+secrets/*.pem
+
+# Данные контейнеров
+data/jenkins_home/secrets/
+data/jenkins_home/plugins/
+data/jenkins_home/jobs/*/builds/
+
+# Логи и временные файлы
+*.log
+logs/
+temp/
+
+# SSL сертификаты
+nginx/ssl/*.crt
+nginx/ssl/*.key
+
+# Резервные копии
+*.bak
+*.backup
+
+# IDE файлы
+.vscode/
+.idea/
+*.swp
+```
+
+Команды для создания структуры:
+
+```bash
+# Создание основной структуры
+mkdir -p \
+  jenkins-iac-corporate/{casc,kerberos,scripts,shared_scripts/{groovy,powershell,python,bash,pipelines}} \
+  jenkins-iac-corporate/{nginx/{conf.d,ssl},ansible/inventory,secrets,data/{jenkins_home,ansible,shared}} \
+  jenkins-iac-corporate/{tests,validation,docs}
+
+# Создание основных файлов
+touch jenkins-iac-corporate/docker-compose.yml
+touch jenkins-iac-corporate/Dockerfile
+touch jenkins-iac-corporate/.env
+touch jenkins-iac-corporate/.env.example
+touch jenkins-iac-corporate/deploy.sh
+touch jenkins-iac-corporate/plugins.txt
+
+# Создание конфигурационных файлов
+touch jenkins-iac-corporate/casc/jenkins.yaml
+touch jenkins-iac-corporate/kerberos/krb5.conf
+
+# Создание скриптов
+touch jenkins-iac-corporate/scripts/management.sh
+touch jenkins-iac-corporate/scripts/test-ad-connection.sh
+touch jenkins-iac-corporate/scripts/setup-ad-groups.sh
+
+# Создание мульти-языковых скриптов
+touch jenkins-iac-corporate/shared_scripts/groovy/SystemInfo.groovy
+touch jenkins-iac-corporate/shared_scripts/powershell/SystemCheck.ps1
+touch jenkins-iac-corporate/shared_scripts/python/infrastructure_check.py
+touch jenkins-iac-corporate/shared_scripts/bash/system_audit.sh
+touch jenkins-iac-corporate/shared_scripts/pipelines/multi-language-pipeline.jenkinsfile
+
+# Установка прав
+chmod +x jenkins-iac-corporate/scripts/*.sh
+chmod +x jenkins-iac-corporate/shared_scripts/bash/*.sh
+chmod +x jenkins-iac-corporate/shared_scripts/python/*.py
+```
+
+Эта структура обеспечивает:
+
+· ✅ Модульность - четкое разделение ответственности
+· ✅ Безопасность - разделение секретов и конфигурации
+· ✅ Масштабируемость - легко добавлять новые компоненты
+· ✅ Поддержку языков - готовые скрипты на Groovy, PowerShell, Python, Bash
+· ✅ Корпоративные стандарты - AD интеграция, безопасность, документация
+· ✅ Infrastructure as Code - полная воспроизводимость развертывания

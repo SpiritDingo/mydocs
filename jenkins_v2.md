@@ -441,3 +441,618 @@ docker-compose --profile tools up -d ansible-runner
 · ✅ Backup: Volume mapping для persistence
 
 Это решение предоставляет готовую корпоративную платформу для управления инфраструктурой через Ansible с использованием Jenkins как оркестратора.
+
+
+
+Обновленное решение для Docker Compose V2 с использованием современных возможностей:
+
+1. Обновленный docker-compose.yml
+
+docker-compose.yml:
+
+```yaml
+name: jenkins-iac-corporate
+
+services:
+  jenkins:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        JENKINS_VERSION: lts-jdk17
+    container_name: jenkins-iac-corporate
+    hostname: jenkins-iac
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "50000:50000"
+    environment:
+      JENKINS_OPTS: --httpPort=8080
+      CASC_JENKINS_CONFIG: /var/jenkins_conf/casc
+      JAVA_OPTS: -Djenkins.install.runSetupWizard=false -Xmx2g -Xms512m -Duser.timezone=Europe/Moscow
+      JENKINS_SLAVE_AGENT_PORT: 50000
+    env_file:
+      - .env
+    volumes:
+      - jenkins_data:/var/jenkins_home
+      - ansible_data:/var/ansible
+      - ./casc:/var/jenkins_conf/casc:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./scripts:/var/jenkins_scripts:ro
+      - ./shared:/shared:rw
+    networks:
+      jenkins-network:
+        aliases:
+          - jenkins-main
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    configs:
+      - source: plugins_txt
+        target: /usr/share/jenkins/ref/plugins.txt
+    secrets:
+      - source: admin_password
+        target: /run/secrets/jenkins_admin_password
+      - source: smtp_password
+        target: /run/secrets/smtp_password
+
+  ansible-controller:
+    image: quay.io/ansible/ansible-runner:latest
+    container_name: ansible-controller
+    hostname: ansible-controller
+    restart: unless-stopped
+    profiles: ["tools", "monitoring"]
+    volumes:
+      - ansible_data:/runner:rw
+      - ./shared:/shared:rw
+      - ./ansible/inventory:/inventory:ro
+    networks:
+      jenkins-network:
+        aliases:
+          - ansible-runner
+    environment:
+      ANSIBLE_HOST_KEY_CHECKING: "False"
+      ANSIBLE_SSH_RETRIES: "3"
+    healthcheck:
+      test: ["CMD", "ansible", "--version"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  reverse-proxy:
+    image: nginx:alpine
+    container_name: jenkins-proxy
+    restart: unless-stopped
+    profiles: ["proxy"]
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    networks:
+      jenkins-network:
+        aliases:
+          - proxy
+    depends_on:
+      - jenkins
+
+networks:
+  jenkins-network:
+    name: jenkins-corporate-network
+    driver: bridge
+    attachable: true
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+
+volumes:
+  jenkins_data:
+    name: jenkins_corporate_data
+    driver: local
+  ansible_data:
+    name: ansible_corporate_data
+    driver: local
+
+configs:
+  plugins_txt:
+    file: ./plugins.txt
+
+secrets:
+  admin_password:
+    file: ./secrets/jenkins_admin_password.txt
+  smtp_password:
+    file: ./secrets/smtp_password.txt
+```
+
+2. Обновленный Dockerfile
+
+Dockerfile:
+
+```dockerfile
+# syntax=docker/dockerfile:1.4
+
+ARG JENKINS_VERSION=lts-jdk17
+
+FROM jenkins/jenkins:${JENKINS_VERSION} as base
+
+USER root
+
+# Метка для безопасности
+LABEL security.scan="true" \
+      maintainer="devops@company.com" \
+      version="1.0"
+
+# Установка базовых утилит
+RUN <<EOT
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        python3 \
+        python3-pip \
+        git \
+        sshpass \
+        openssh-client \
+        curl \
+        gnupg \
+        software-properties-common \
+        jq \
+        unzip
+    rm -rf /var/lib/apt/lists/*
+    apt-get clean
+EOT
+
+# Многоступенчатая установка для оптимизации
+FROM base as ansible-install
+
+RUN pip3 install --no-cache-dir ansible ansible-lint yamllint ansible-tower-cli
+
+FROM base as docker-install
+
+RUN <<EOT
+    curl -fsSL https://get.docker.com | sh
+    usermod -aG docker jenkins
+EOT
+
+FROM base as final
+
+# Копируем установленные компоненты
+COPY --from=ansible-install /usr/local/lib/python3.9/dist-packages /usr/local/lib/python3.9/dist-packages
+COPY --from=ansible-install /usr/local/bin/ansible* /usr/local/bin/
+COPY --from=docker-install /usr/bin/docker /usr/bin/docker
+COPY --from=docker-install /var/run/docker.sock /var/run/docker.sock
+
+# Создание структуры директорий
+RUN <<EOT
+    mkdir -p /var/jenkins_conf/casc /var/ansible /shared
+    chown -R jenkins:jenkins /var/jenkins_conf /var/ansible /shared
+EOT
+
+# Копирование скриптов
+COPY --chown=jenkins:jenkins scripts/ /var/jenkins_scripts/
+RUN chmod +x /var/jenkins_scripts/*.sh
+
+# Установка плагинов через установленный скрипт
+RUN /usr/local/bin/install-plugins.sh < /usr/share/jenkins/ref/plugins.txt
+
+USER jenkins
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=1m --retries=3 \
+  CMD curl -f http://localhost:8080 || exit 1
+```
+
+3. Современный список плагинов
+
+plugins.txt:
+
+```txt
+# Pipeline & DSL
+workflow-aggregator:latest
+pipeline-stage-view:latest
+job-dsl:latest
+blueocean:latest
+
+# Ansible & Infrastructure
+ansible:latest
+ansible-tower:latest
+
+# Version Control
+git:latest
+github:latest
+gitlab:latest
+bitbucket:latest
+
+# Security & Auth
+matrix-auth:latest
+role-strategy:latest
+credentials-binding:latest
+ssh-credentials:latest
+ssh-slaves:latest
+
+# Configuration as Code
+configuration-as-code:latest
+jcascom-configuration-as-code-support:latest
+
+# Docker & Kubernetes
+docker-workflow:latest
+docker-plugin:latest
+kubernetes:latest
+
+# Notifications & Monitoring
+email-ext:latest
+mailer:latest
+telegram-notifications:latest
+slack:latest
+
+# Utilities
+timestamper:latest
+ws-cleanup:latest
+build-timeout:latest
+parameterized-trigger:latest
+copyartifact:latest
+envinject:latest
+htmlpublisher:latest
+pipeline-utility-steps:latest
+
+# UI & Experience
+simple-theme-plugin:latest
+dashboard-view:latest
+```
+
+4. Обновленная конфигурация JCasC
+
+casc/jenkins.yaml:
+
+```yaml
+jenkins:
+  agentProtocols:
+    - "JNLP4-connect"
+    - "Ping"
+  authorizationStrategy:
+    globalMatrix:
+      permissions:
+        - "Overall/Administer:admin"
+        - "Overall/Read:authenticated"
+        - "Job/Read:authenticated"
+        - "Job/Configure:admin"
+        - "Job/Build:admin"
+        - "Job/Cancel:admin"
+        - "View/Read:authenticated"
+  clouds: []
+  disabledAdministrativeMonitors:
+    - "hudson.diagnosis.ReverseProxySetupMonitor"
+  label: "master"
+  mode: NORMAL
+  numExecutors: 5
+  primaryView:
+    all:
+      name: "all"
+  quietPeriod: 5
+  remotingSecurity:
+    enabled: true
+  scmCheckoutRetryCount: 2
+  securityRealm:
+    local:
+      allowsSignup: false
+      users:
+        - id: "admin"
+          name: "Jenkins Administrator"
+          password: "${ADMIN_PASSWORD}"
+  slaveAgentPort: 50000
+  systemMessage: "Jenkins Infrastructure as Code Platform\nКорпоративная система управления конфигурацией"
+  views:
+    - all:
+        name: "all"
+  viewsTabBar: "standard"
+
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          - usernamePassword:
+              scope: GLOBAL
+              id: "git-corporate-credentials"
+              username: "git-service"
+              password: "${GIT_PASSWORD}"
+          - sshUsernamePrivateKey:
+              scope: GLOBAL
+              id: "ansible-corporate-key"
+              username: "ansible"
+              privateKeySource:
+                directEntry:
+                  privateKey: "${ANSIBLE_SSH_KEY}"
+          - string:
+              scope: GLOBAL
+              id: "ansible-vault-corporate"
+              secret: "${ANSIBLE_VAULT_PASSWORD}"
+          - usernamePassword:
+              scope: GLOBAL
+              id: "docker-registry"
+              username: "${DOCKER_REGISTRY_USER}"
+              password: "${DOCKER_REGISTRY_PASSWORD}"
+
+tool:
+  git:
+    installations:
+      - name: "git"
+        home: "/usr/bin/git"
+  ansible:
+    installations:
+      - name: "ansible"
+        home: "/usr/local/bin/ansible"
+
+unclassified:
+  location:
+    url: "${JENKINS_URL}"
+    adminAddress: "jenkins-admin@company.com"
+  
+  mailer:
+    smtpHost: "smtp.company.com"
+    smtpPort: "587"
+    useSsl: true
+    smtpAuth: true
+    username: "jenkins-noreply@company.com"
+    password: "${SMTP_PASSWORD}"
+    charset: "UTF-8"
+  
+  systemd:
+    enable: false
+  
+  securityFilters:
+    adminForJob: true
+  
+  buildDiscarders:
+    configuredBuildDiscarders:
+      - strategy:
+          daysToKeep: "30"
+          numToKeep: "50"
+          artifactDaysToKeep: "15"
+          artifactNumToKeep: "20"
+
+security:
+  apiToken:
+    creationOfLegacyTokenEnabled: false
+    tokenGenerationOnCreationEnabled: true
+  sshd:
+    enabled: false
+  sSHD:
+    port: -1
+```
+
+5. Современные скрипты управления
+
+deploy.sh:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+log() {
+    echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')] $1${NC}"
+}
+
+warn() {
+    echo -e "${YELLOW}[WARN] $1${NC}"
+}
+
+error() {
+    echo -e "${RED}[ERROR] $1${NC}"
+}
+
+check_dependencies() {
+    log "Проверка зависимостей..."
+    local deps=("docker" "docker-compose")
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &> /dev/null; then
+            error "Не найдена зависимость: $dep"
+            exit 1
+        fi
+    done
+    log "✓ Все зависимости удовлетворены"
+}
+
+setup_environment() {
+    log "Настройка окружения..."
+    
+    # Создание директорий
+    mkdir -p {casc,scripts,shared,secrets,nginx/{conf.d,ssl},ansible/inventory}
+    
+    # Настройка прав
+    chmod 755 scripts/*.sh 2>/dev/null || true
+    chmod 600 secrets/*.txt 2>/dev/null || true
+    
+    # Проверка .env файла
+    if [[ ! -f .env ]]; then
+        warn "Файл .env не найден. Создание шаблона..."
+        cp .env.example .env
+        error "Отредактируйте .env файл перед запуском"
+        exit 1
+    fi
+    
+    source .env
+}
+
+build_images() {
+    log "Сборка Docker образов..."
+    docker compose build --pull --no-cache
+}
+
+start_services() {
+    log "Запуск сервисов..."
+    
+    # Основные сервисы
+    docker compose up -d jenkins
+    
+    # Дополнительные сервисы (опционально)
+    if [[ ${ENABLE_TOOLS:-false} == "true" ]]; then
+        docker compose --profile tools up -d ansible-controller
+    fi
+    
+    if [[ ${ENABLE_PROXY:-false} == "true" ]]; then
+        docker compose --profile proxy up -d reverse-proxy
+    fi
+}
+
+wait_for_jenkins() {
+    log "Ожидание запуска Jenkins..."
+    local timeout=120
+    local counter=0
+    
+    while ! curl -s -f "http://localhost:8080" > /dev/null; do
+        sleep 5
+        counter=$((counter + 5))
+        if [[ $counter -ge $timeout ]]; then
+            error "Таймаут ожидания Jenkins"
+            docker compose logs jenkins
+            exit 1
+        fi
+    done
+    log "✓ Jenkins запущен"
+}
+
+setup_initial_config() {
+    log "Настройка начальной конфигурации..."
+    
+    # Создание shared директорий
+    mkdir -p shared/{ansible,terraform,scripts}
+    
+    log "✓ Настройка завершена"
+    log "🌐 Jenkins доступен по адресу: http://localhost:8080"
+    
+    # Показ initial admin password если существует
+    if docker compose exec jenkins test -f /var/jenkins_home/secrets/initialAdminPassword; then
+        log "🔑 Initial Admin Password:"
+        docker compose exec jenkins cat /var/jenkins_home/secrets/initialAdminPassword
+    fi
+}
+
+main() {
+    log "🚀 Запуск корпоративного Jenkins для Infrastructure as Code"
+    
+    check_dependencies
+    setup_environment
+    build_images
+    start_services
+    wait_for_jenkins
+    setup_initial_config
+    
+    log "✅ Развертывание завершено успешно!"
+}
+
+main "$@"
+```
+
+6. Файл окружения
+
+.env:
+
+```env
+# Corporate Jenkins Configuration
+COMPOSE_PROJECT_NAME=jenkins-iac-corporate
+JENKINS_URL=http://jenkins.company.com
+
+# Security Secrets
+ADMIN_PASSWORD=secure_corporate_password_2024
+SMTP_PASSWORD=smtp_corporate_password_2024
+GIT_PASSWORD=gitlab_corporate_token_2024
+ANSIBLE_VAULT_PASSWORD=vault_corporate_2024
+DOCKER_REGISTRY_USER=registry-user
+DOCKER_REGISTRY_PASSWORD=registry_corporate_2024
+
+# Ansible SSH Key (будет переопределен)
+ANSIBLE_SSH_KEY=ssh-rsa AAAAB3NzaC1yc2E...
+
+# Features
+ENABLE_TOOLS=true
+ENABLE_PROXY=false
+ENABLE_MONITORING=true
+
+# Network
+JENKINS_NETWORK_SUBNET=172.20.0.0/24
+```
+
+7. Команды управления
+
+scripts/management.sh:
+
+```bash
+#!/usr/bin/env bash
+
+case "${1:-}" in
+    start)
+        docker compose up -d
+        ;;
+    stop)
+        docker compose down
+        ;;
+    restart)
+        docker compose restart
+        ;;
+    rebuild)
+        docker compose down
+        docker compose build --no-cache
+        docker compose up -d
+        ;;
+    logs)
+        docker compose logs -f "${2:-jenkins}"
+        ;;
+    backup)
+        docker compose exec jenkins tar czf /shared/jenkins-backup-$(date +%Y%m%d).tar.gz -C /var/jenkins_home .
+        ;;
+    status)
+        docker compose ps
+        ;;
+    shell)
+        docker compose exec "${2:-jenkins}" bash
+        ;;
+    update)
+        docker compose pull
+        docker compose build --pull
+        docker compose up -d
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|rebuild|logs|backup|status|shell|update}"
+        exit 1
+        ;;
+esac
+```
+
+Запуск решения
+
+```bash
+# Сделать скрипты исполняемыми
+chmod +x deploy.sh scripts/management.sh
+
+# Развертывание
+./deploy.sh
+
+# Управление
+./scripts/management.sh start
+./scripts/management.sh status
+
+# Логи
+./scripts/management.sh logs jenkins
+
+# Обновление
+./scripts/management.sh update
+```
+
+Особенности Docker Compose V2:
+
+· ✅ Проектные именования - автоматическое префиксирование
+· ✅ Secrets & Configs - встроенная поддержка секретов
+· ✅ Профили - избирательный запуск сервисов
+· ✅ Healthchecks - мониторинг состояния
+· ✅ Более эффективная сборка - многоступенчатые образы
+· ✅ Улучшенная сеть - явное управление сетями
+· ✅ Лучшая производительность - оптимизированная работа с volumes
+
+Это решение предоставляет полную корпоративную платформу для Infrastructure as Code с использованием современных возможностей Docker Compose V2.

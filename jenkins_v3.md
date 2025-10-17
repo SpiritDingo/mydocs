@@ -1831,3 +1831,796 @@ cp .env.example .env
 ```
 
 Это полное корпоративное решение готово к использованию с поддержкой Active Directory, мульти-языковой автоматизацией и всеми необходимыми инструментами для Infrastructure as Code.
+
+
+
+Исправляем ошибку с docker-compose. В современных версиях Docker используется docker compose (без дефиса) как встроенная команда.
+
+Обновленные скрипты с исправлением:
+
+1. Обновленный deploy.sh
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log() {
+    echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')] $1${NC}"
+}
+
+warn() {
+    echo -e "${YELLOW}[WARN] $1${NC}"
+}
+
+error() {
+    echo -e "${RED}[ERROR] $1${NC}"
+}
+
+check_dependencies() {
+    log "Проверка зависимостей..."
+    
+    # Проверка Docker
+    if ! command -v docker &> /dev/null; then
+        error "Docker не установлен"
+        echo "Установите Docker: https://docs.docker.com/get-docker/"
+        exit 1
+    fi
+    
+    # Проверка Docker Compose (modern plugin version)
+    if ! docker compose version &> /dev/null; then
+        error "Docker Compose не установлен или не работает"
+        echo "Установите Docker Compose: https://docs.docker.com/compose/install/"
+        exit 1
+    fi
+    
+    log "✓ Docker версия: $(docker --version)"
+    log "✓ Docker Compose версия: $(docker compose version)"
+    log "✓ Все зависимости удовлетворены"
+}
+
+setup_environment() {
+    log "Настройка окружения..."
+    
+    mkdir -p {casc,scripts,shared_scripts/{groovy,powershell,python,bash,pipelines},secrets,nginx/{conf.d,ssl},data/{jenkins_home,ansible/inventory,shared}}
+    
+    chmod 755 scripts/*.sh 2>/dev/null || true
+    chmod 600 secrets/*.txt 2>/dev/null || true
+    chmod +x shared_scripts/bash/*.sh 2>/dev/null || true
+    chmod +x shared_scripts/python/*.py 2>/dev/null || true
+    
+    if [[ ! -f .env ]]; then
+        warn "Файл .env не найден. Создание из шаблона..."
+        cp .env.example .env
+        echo -e "${YELLOW}Отредактируйте .env файл перед запуском:${NC}"
+        echo "  nano .env"
+        echo -e "${YELLOW}Затем запустите скрипт снова:${NC}"
+        echo "  ./deploy.sh"
+        exit 1
+    fi
+    
+    # Загрузка переменных окружения
+    set -a
+    source .env
+    set +a
+    
+    log "✓ Окружение настроено"
+}
+
+check_ad_connectivity() {
+    if [[ ${ENABLE_AD_TEST:-false} == "true" ]]; then
+        log "Проверка подключения к Active Directory..."
+        if docker compose run --rm jenkins /var/jenkins_scripts/test-ad-connection.sh; then
+            log "✓ Подключение к AD успешно"
+        else
+            error "❌ Ошибка подключения к AD"
+            warn "Продолжение развертывания, но AD может не работать"
+        fi
+    fi
+}
+
+build_images() {
+    log "Сборка Docker образов..."
+    docker compose build --pull --no-cache
+}
+
+start_services() {
+    log "Запуск сервисов..."
+    
+    docker compose up -d jenkins
+    
+    if [[ ${ENABLE_TOOLS:-false} == "true" ]]; then
+        docker compose --profile tools up -d ansible-controller
+    fi
+    
+    if [[ ${ENABLE_PROXY:-false} == "true" ]]; then
+        docker compose --profile proxy up -d reverse-proxy
+    fi
+    
+    if [[ ${ENABLE_AD_TEST:-false} == "true" ]]; then
+        docker compose --profile ad-test up -d ldap-admin
+    fi
+}
+
+wait_for_jenkins() {
+    log "Ожидание запуска Jenkins..."
+    local timeout=180
+    local counter=0
+    
+    while ! curl -s -f "http://localhost:8080" > /dev/null; do
+        sleep 5
+        counter=$((counter + 5))
+        echo "Ожидание... ${counter}с"
+        if [[ $counter -ge $timeout ]]; then
+            error "Таймаут ожидания Jenkins"
+            docker compose logs jenkins
+            exit 1
+        fi
+    done
+    log "✓ Jenkins запущен"
+}
+
+get_initial_password() {
+    log "Получение initial admin password..."
+    
+    local max_attempts=30
+    local attempt=0
+    
+    while [[ $attempt -lt $max_attempts ]]; do
+        if docker compose exec jenkins test -f /var/jenkins_home/secrets/initialAdminPassword; then
+            log "🔑 Initial Admin Password:"
+            docker compose exec jenkins cat /var/jenkins_home/secrets/initialAdminPassword
+            return 0
+        fi
+        sleep 5
+        attempt=$((attempt + 1))
+    done
+    
+    warn "Initial admin password не найден. Проверьте логи Jenkins."
+    docker compose logs jenkins
+}
+
+setup_initial_config() {
+    log "Настройка начальной конфигурации..."
+    
+    mkdir -p shared/{ansible,terraform,scripts,reports,backups}
+    
+    # Копирование скриптов в общую директорию
+    cp -r shared_scripts/* shared/scripts/ 2>/dev/null || true
+    
+    log "✓ Настройка завершена"
+    log "🌐 Jenkins доступен по адресу: http://localhost:8080"
+    log "🐋 Для управления используйте: ./scripts/management.sh"
+}
+
+check_system_resources() {
+    log "Проверка системных ресурсов..."
+    
+    local total_memory=$(free -g | awk 'NR==2{print $2}')
+    local available_disk=$(df -h / | awk 'NR==2{print $4}')
+    
+    if [[ $total_memory -lt 4 ]]; then
+        warn "Мало оперативной памяти (доступно: ${total_memory}GB, рекомендуется: 4GB+)"
+    else
+        log "✓ Оперативная память: ${total_memory}GB"
+    fi
+    
+    log "✓ Свободное место на диске: ${available_disk}"
+}
+
+main() {
+    echo -e "${BLUE}"
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║           Jenkins Infrastructure as Code - Deploy           ║"
+    echo "║         Корпоративное решение с AD интеграцией              ║"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+    
+    check_dependencies
+    check_system_resources
+    setup_environment
+    build_images
+    check_ad_connectivity
+    start_services
+    wait_for_jenkins
+    get_initial_password
+    setup_initial_config
+    
+    echo -e "${GREEN}"
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║                     ДЕПЛОЙ ЗАВЕРШЕН!                        ║"
+    echo "╠══════════════════════════════════════════════════════════════╣"
+    echo "║ 🔐  Jenkins интегрирован с Active Directory                 ║"
+    echo "║ 💻  Поддержка языков: Groovy, PowerShell, Python, Bash      ║"
+    echo "║ 🐋  Управление: ./scripts/management.sh                     ║"
+    echo "║ 🌐  Доступ: http://localhost:8080                           ║"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+}
+
+main "$@"
+```
+
+2. Обновленный scripts/management.sh
+
+```bash
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Цвета для вывода
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log() {
+    echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')] $1${NC}"
+}
+
+warn() {
+    echo -e "${YELLOW}[WARN] $1${NC}"
+}
+
+error() {
+    echo -e "${RED}[ERROR] $1${NC}"
+}
+
+check_compose() {
+    if ! docker compose version &> /dev/null; then
+        error "Docker Compose не доступен"
+        exit 1
+    fi
+}
+
+show_usage() {
+    echo -e "${BLUE}Использование: $0 {start|stop|restart|rebuild|logs|backup|status|shell|update|test-ad|info}${NC}"
+    echo ""
+    echo "Команды:"
+    echo "  start     - Запуск всех сервисов"
+    echo "  stop      - Остановка всех сервисов"
+    echo "  restart   - Перезапуск всех сервисов"
+    echo "  rebuild   - Пересборка и перезапуск"
+    echo "  logs      - Просмотр логов (можно указать сервис: $0 logs jenkins)"
+    echo "  backup    - Создание бэкапа Jenkins"
+    echo "  status    - Статус сервисов"
+    echo "  shell     - Вход в контейнер (по умолчанию: jenkins)"
+    echo "  update    - Обновление образов и перезапуск"
+    echo "  test-ad   - Тестирование подключения к AD"
+    echo "  info      - Информация о системе"
+    echo ""
+}
+
+case "${1:-}" in
+    start)
+        check_compose
+        log "Запуск сервисов Jenkins..."
+        docker compose up -d
+        log "Сервисы запущены"
+        ;;
+    stop)
+        check_compose
+        log "Остановка сервисов..."
+        docker compose down
+        log "Сервисы остановлены"
+        ;;
+    restart)
+        check_compose
+        log "Перезапуск сервисов..."
+        docker compose restart
+        log "Сервисы перезапущены"
+        ;;
+    rebuild)
+        check_compose
+        log "Пересборка и перезапуск..."
+        docker compose down
+        docker compose build --no-cache
+        docker compose up -d
+        log "Пересборка завершена"
+        ;;
+    logs)
+        check_compose
+        service="${2:-}"
+        if [[ -n "$service" ]]; then
+            log "Просмотр логов сервиса: $service"
+            docker compose logs -f "$service"
+        else
+            log "Просмотр логов всех сервисов"
+            docker compose logs -f
+        fi
+        ;;
+    backup)
+        check_compose
+        log "Создание бэкапа Jenkins..."
+        backup_file="jenkins_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
+        docker compose exec -T jenkins tar czf "/shared/$backup_file" -C /var/jenkins_home .
+        log "Бэкап создан: shared/$backup_file"
+        ;;
+    status)
+        check_compose
+        log "Статус сервисов:"
+        docker compose ps
+        ;;
+    shell)
+        check_compose
+        service="${2:-jenkins}"
+        log "Вход в контейнер: $service"
+        docker compose exec "$service" bash
+        ;;
+    update)
+        check_compose
+        log "Обновление образов..."
+        docker compose pull
+        docker compose build --pull
+        docker compose up -d
+        log "Обновление завершено"
+        ;;
+    test-ad)
+        check_compose
+        log "Тестирование подключения к Active Directory..."
+        docker compose run --rm jenkins /var/jenkins_scripts/test-ad-connection.sh
+        ;;
+    info)
+        check_compose
+        echo -e "${BLUE}"
+        echo "╔══════════════════════════════════════════════════════════════╗"
+        echo "║                   Jenkins System Info                       ║"
+        echo "╠══════════════════════════════════════════════════════════════╣"
+        echo -e "${NC}"
+        echo "Сервисы:"
+        docker compose ps
+        echo ""
+        echo "Сети:"
+        docker network ls | grep jenkins
+        echo ""
+        echo "Тома:"
+        docker volume ls | grep jenkins
+        echo ""
+        echo "Логины по умолчанию:"
+        echo "  Jenkins: http://localhost:8080"
+        echo "  LDAP Admin: http://localhost:8081 (если включен)"
+        ;;
+    *)
+        show_usage
+        exit 1
+        ;;
+esac
+```
+
+3. Создаем скрипт установки зависимостей scripts/install-dependencies.sh
+
+```bash
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+log() {
+    echo -e "${GREEN}[INFO] $1${NC}"
+}
+
+warn() {
+    echo -e "${YELLOW}[WARN] $1${NC}"
+}
+
+error() {
+    echo -e "${RED}[ERROR] $1${NC}"
+}
+
+install_docker_ubuntu() {
+    log "Установка Docker на Ubuntu/Debian..."
+    
+    # Обновление пакетов
+    sudo apt-get update
+    sudo apt-get install -y ca-certificates curl gnupg
+    
+    # Добавление Docker репозитория
+    sudo install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    sudo chmod a+r /etc/apt/keyrings/docker.gpg
+    
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+    
+    # Установка Docker
+    sudo apt-get update
+    sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    
+    # Добавление пользователя в группу docker
+    sudo usermod -aG docker $USER
+    
+    log "✓ Docker установлен"
+}
+
+install_docker_centos() {
+    log "Установка Docker на CentOS/RHEL..."
+    
+    # Установка yum-utils
+    sudo yum install -y yum-utils
+    
+    # Добавление Docker репозитория
+    sudo yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+    
+    # Установка Docker
+    sudo yum install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    
+    # Запуск и включение Docker
+    sudo systemctl start docker
+    sudo systemctl enable docker
+    
+    # Добавление пользователя в группу docker
+    sudo usermod -aG docker $USER
+    
+    log "✓ Docker установлен"
+}
+
+install_docker_macos() {
+    log "Установка Docker на macOS..."
+    warn "Пожалуйста, установите Docker Desktop вручную:"
+    echo "  https://docs.docker.com/desktop/install/mac-install/"
+    echo ""
+    echo "После установки запустите Docker Desktop и убедитесь, что он работает."
+    exit 1
+}
+
+install_docker_windows() {
+    log "Установка Docker на Windows..."
+    warn "Пожалуйста, установите Docker Desktop вручную:"
+    echo "  https://docs.docker.com/desktop/install/windows-install/"
+    echo ""
+    echo "После установки запустите Docker Desktop и убедитесь, что он работает."
+    exit 1
+}
+
+detect_os() {
+    case "$(uname -s)" in
+        Linux*)
+            if [[ -f /etc/os-release ]]; then
+                source /etc/os-release
+                case $ID in
+                    ubuntu|debian)
+                        install_docker_ubuntu
+                        ;;
+                    centos|rhel|fedora)
+                        install_docker_centos
+                        ;;
+                    *)
+                        error "Неподдерживаемый дистрибутив Linux: $ID"
+                        exit 1
+                        ;;
+                esac
+            else
+                error "Не удалось определить дистрибутив Linux"
+                exit 1
+            fi
+            ;;
+        Darwin*)
+            install_docker_macos
+            ;;
+        CYGWIN*|MINGW32*|MINGW64*|MSYS*)
+            install_docker_windows
+            ;;
+        *)
+            error "Неподдерживаемая ОС: $(uname -s)"
+            exit 1
+            ;;
+    esac
+}
+
+verify_installation() {
+    log "Проверка установки..."
+    
+    if ! command -v docker &> /dev/null; then
+        error "Docker не установлен корректно"
+        exit 1
+    fi
+    
+    if ! docker compose version &> /dev/null; then
+        error "Docker Compose не установлен корректно"
+        exit 1
+    fi
+    
+    log "✓ Docker версия: $(docker --version)"
+    log "✓ Docker Compose версия: $(docker compose version)"
+    
+    # Тестовый запуск
+    if ! docker run --rm hello-world &> /dev/null; then
+        warn "Docker не может запускать контейнеры. Возможно, нужна перезагрузка."
+        echo "Пожалуйста, выполните:"
+        echo "  sudo systemctl restart docker"
+        echo "Или перезагрузите систему"
+    else
+        log "✓ Docker работает корректно"
+    fi
+}
+
+main() {
+    echo -e "${GREEN}"
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║              Установка Docker и зависимостей                ║"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+    
+    # Проверка прав
+    if [[ $EUID -eq 0 ]]; then
+        error "Не запускайте скрипт от root. Скрипт запросит права когда нужно."
+        exit 1
+    fi
+    
+    # Проверка уже установленного Docker
+    if command -v docker &> /dev/null && docker compose version &> /dev/null; then
+        log "Docker и Docker Compose уже установлены"
+        verify_installation
+        exit 0
+    fi
+    
+    log "Обнаружена ОС: $(uname -s)"
+    detect_os
+    
+    verify_installation
+    
+    echo ""
+    log "🎉 Установка завершена успешно!"
+    warn "⚠️  Для применения изменений可能需要 перезагрузка或重新登录"
+    echo ""
+    log "Далее выполните:"
+    echo "  ./deploy.sh"
+    echo ""
+}
+
+main "$@"
+```
+
+4. Создаем README с инструкциями
+
+README.md:
+
+```markdown
+# Jenkins Infrastructure as Code - Корпоративное решение
+
+Полное решение для развертывания Jenkins с поддержкой Active Directory и мульти-языковой автоматизацией.
+
+## 🚀 Быстрый старт
+
+### 1. Установка зависимостей
+
+Если Docker не установлен:
+
+```bash
+# Автоматическая установка Docker
+chmod +x scripts/install-dependencies.sh
+./scripts/install-dependencies.sh
+
+# Или установите вручную:
+# https://docs.docker.com/get-docker/
+```
+
+2. Настройка окружения
+
+```bash
+# Копируем пример настроек
+cp .env.example .env
+
+# Редактируем настройки
+nano .env
+```
+
+3. Запуск развертывания
+
+```bash
+# Делаем скрипт исполняемым
+chmod +x deploy.sh
+
+# Запускаем деплой
+./deploy.sh
+```
+
+📋 Требования
+
+· Docker Engine 20.10+
+· Docker Compose Plugin 2.0+
+· 4GB+ RAM
+· 20GB+ свободного места
+
+🛠 Управление
+
+```bash
+# Запуск/остановка
+./scripts/management.sh start
+./scripts/management.sh stop
+
+# Просмотр логов
+./scripts/management.sh logs
+./scripts/management.sh logs jenkins
+
+# Бэкап
+./scripts/management.sh backup
+
+# Тестирование AD
+./scripts/management.sh test-ad
+
+# Статус сервисов
+./scripts/management.sh status
+```
+
+🌐 Доступ
+
+· Jenkins: http://localhost:8080
+· LDAP Admin: http://localhost:8081 (если включен)
+· Initial Password: будет показан после деплоя
+
+🔧 Особенности
+
+· ✅ Active Directory интеграция
+· ✅ Поддержка языков: Groovy, PowerShell, Python, Bash
+· ✅ Docker Compose V2 (современная версия)
+· ✅ Configuration as Code
+· ✅ Мульти-языковые скрипты
+· ✅ Корпоративная безопасность
+
+🐛 Решение проблем
+
+Ошибка: "Не найдена зависимость: docker-compose"
+
+Используется современная версия Docker Compose как плагин:
+
+```bash
+# Проверка установки
+docker compose version
+
+# Если не установлен, обновите Docker:
+# https://docs.docker.com/engine/install/
+```
+
+Ошибка прав доступа
+
+```bash
+# Добавьте пользователя в группу docker
+sudo usermod -aG docker $USER
+
+# Перезайдите в систему или выполните:
+newgrp docker
+```
+
+Проблемы с памятью
+
+Увеличьте лимиты Docker в настройках Docker Desktop или в /etc/docker/daemon.json:
+
+```json
+{
+  "default-shm-size": "1g",
+  "memory": "4g"
+}
+```
+
+📁 Структура проекта
+
+```
+jenkins-iac-corporate/
+├── deploy.sh                 # Основной скрипт развертывания
+├── scripts/
+│   ├── management.sh         # Управление сервисами
+│   └── install-dependencies.sh # Установка Docker
+└── shared_scripts/           # Мульти-языковые скрипты
+```
+
+🤝 Поддержка
+
+При проблемах с развертыванием:
+
+1. Проверьте что Docker запущен: docker info
+2. Проверьте логи: ./scripts/management.sh logs
+3. Убедитесь что порты 8080 и 50000 свободны
+
+```
+
+## 5. Создаем `.env.example` с правильными настройками
+
+```env
+# Corporate Jenkins Configuration
+COMPOSE_PROJECT_NAME=jenkins-iac-corporate
+JENKINS_URL=http://localhost:8080
+
+# Active Directory Configuration
+AD_DOMAIN=company.com
+AD_DOMAIN_CONTROLLER1=dc1.company.com
+AD_DOMAIN_CONTROLLER2=dc2.company.com
+AD_BIND_USER=svc_jenkins@company.com
+AD_BIND_PASSWORD=change_this_password
+AD_BASE_DN=DC=company,DC=com
+AD_USER_SEARCH_BASE=OU=Users,DC=company,DC=com
+AD_GROUP_SEARCH_BASE=OU=Groups,DC=company,DC=com
+AD_DNS_SERVER_1=192.168.1.1
+AD_DNS_SERVER_2=192.168.1.2
+
+# Security Secrets - CHANGE THESE!
+ADMIN_PASSWORD=change_this_admin_password
+SMTP_PASSWORD=change_this_smtp_password
+GIT_PASSWORD=change_this_git_token
+ANSIBLE_VAULT_PASSWORD=change_this_vault_password
+DOCKER_REGISTRY_USER=registry-user
+DOCKER_REGISTRY_PASSWORD=change_this_registry_password
+
+# Scripting & Language Security
+PYTHON_API_KEY=change_this_python_api_key
+POWERSHELL_ENCRYPTION_KEY=change_this_powershell_key
+
+# Ansible SSH Key (замените на свой)
+ANSIBLE_SSH_KEY=ssh-rsa AAAAB3NzaC1yc2E...change_this_ssh_key
+
+# Features
+ENABLE_TOOLS=true
+ENABLE_PROXY=false
+ENABLE_MONITORING=true
+ENABLE_AD_TEST=false
+ENABLE_MULTI_LANGUAGE=true
+
+# Network
+JENKINS_NETWORK_SUBNET=172.20.0.0/24
+```
+
+6. Создаем скрипт инициализации
+
+init-project.sh:
+
+```bash
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+echo "🎯 Инициализация проекта Jenkins Infrastructure as Code..."
+
+# Создание необходимых директорий
+mkdir -p {casc,scripts,shared_scripts/{groovy,powershell,python,bash,pipelines},secrets,nginx/{conf.d,ssl},data/{jenkins_home,ansible/inventory,shared}}
+
+# Создание основных файлов если их нет
+[[ ! -f .env ]] && cp .env.example .env
+[[ ! -f docker-compose.yml ]] && echo "# Docker Compose file will be created" > docker-compose.yml
+
+# Установка прав на скрипты
+chmod +x scripts/*.sh 2>/dev/null || true
+chmod +x shared_scripts/bash/*.sh 2>/dev/null || true
+chmod +x shared_scripts/python/*.py 2>/dev/null || true
+
+# Создание базовых секретов если их нет
+[[ ! -f secrets/jenkins_admin_password.txt ]] && echo "change_this_password" > secrets/jenkins_admin_password.txt
+[[ ! -f secrets/ad_bind_password.txt ]] && echo "change_this_password" > secrets/ad_bind_password.txt
+chmod 600 secrets/*.txt 2>/dev/null || true
+
+echo "✅ Инициализация завершена!"
+echo ""
+echo "📝 Следующие шаги:"
+echo "1. Отредактируйте файл .env: nano .env"
+echo "2. Запустите развертывание: ./deploy.sh"
+echo ""
+echo "🔧 Или установите зависимости: ./scripts/install-dependencies.sh"
+```
+
+Запуск проекта:
+
+```bash
+# Делаем все скрипты исполняемыми
+chmod +x init-project.sh
+chmod +x deploy.sh
+chmod +x scripts/*.sh
+
+# Инициализация проекта
+./init-project.sh
+
+# Установка зависимостей (если нужно)
+./scripts/install-dependencies.sh
+
+# Запуск деплоя
+./deploy.sh
+```
+
+Теперь проект использует современную версию Docker Compose (docker compose) вместо устаревшей (docker-compose), что решает проблему с зависимостями.

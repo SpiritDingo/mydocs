@@ -3416,3 +3416,558 @@ chmod +x scripts/*.sh
 ```
 
 Теперь проект использует современную версию Docker Compose (docker compose) вместо устаревшей (docker-compose), что решает проблему с зависимостями.
+
+
+Исправляем Dockerfile для работы с Oracle Linux и устанавливаем .NET SDK правильно. Проблема в том, что мы используем Debian-пакеты в Oracle Linux контейнере.
+
+Исправленный Dockerfile
+
+```dockerfile
+# syntax=docker/dockerfile:1.4
+
+ARG JENKINS_VERSION=lts-jdk17
+
+FROM jenkins/jenkins:${JENKINS_VERSION} as base
+
+USER root
+
+LABEL security.scan="true" \
+      maintainer="devops@company.com" \
+      version="2.0" \
+      languages="java,groovy,python,powershell,bash,ansible"
+
+# Определяем дистрибутив и устанавливаем соответствующие пакеты
+RUN <<EOT
+    # Определяем тип пакетного менеджера
+    if command -v apt-get > /dev/null; then
+        # Debian/Ubuntu
+        apt-get update
+        apt-get install -y --no-install-recommends \
+            python3 \
+            python3-pip \
+            python3-venv \
+            git \
+            sshpass \
+            openssh-client \
+            curl \
+            gnupg \
+            software-properties-common \
+            jq \
+            unzip \
+            ldap-utils \
+            krb5-user \
+            libpam-krb5 \
+            libpam-sss \
+            libnss-sss \
+            sssd \
+            sssd-tools \
+            groovy \
+            shellcheck \
+            npm \
+            nodejs \
+            maven \
+            gradle
+        
+        # Установка PowerShell для Debian/Ubuntu
+        apt-get install -y wget apt-transport-https
+        wget -q https://packages.microsoft.com/config/ubuntu/20.04/packages-microsoft-prod.deb
+        dpkg -i packages-microsoft-prod.deb
+        apt-get update
+        apt-get install -y powershell
+        rm packages-microsoft-prod.deb
+        
+    elif command -v yum > /dev/null; then
+        # RHEL/CentOS/Oracle Linux
+        yum update -y
+        yum install -y \
+            python3 \
+            python3-pip \
+            git \
+            sshpass \
+            openssh-clients \
+            curl \
+            gnupg2 \
+            jq \
+            unzip \
+            openldap-clients \
+            krb5-workstation \
+            krb5-libs \
+            sssd \
+            sssd-tools \
+            shellcheck \
+            nodejs \
+            npm \
+            maven \
+            gradle
+        
+        # Установка PowerShell для RHEL/Oracle Linux
+        curl -sSL https://packages.microsoft.com/config/rhel/7/prod.repo | tee /etc/yum.repos.d/microsoft.repo
+        yum install -y powershell
+        
+        # Установка Groovy вручную для RHEL
+        curl -sSL https://archive.apache.org/dist/groovy/4.0.0/distribution/apache-groovy-binary-4.0.0.zip -o groovy.zip
+        unzip groovy.zip -d /opt
+        ln -s /opt/groovy-4.0.0/bin/groovy /usr/bin/groovy
+        ln -s /opt/groovy-4.0.0/bin/groovyc /usr/bin/groovyc
+        rm groovy.zip
+        
+    else
+        echo "Unsupported package manager"
+        exit 1
+    fi
+EOT
+
+# Установка .NET SDK для всех дистрибутивов
+RUN <<EOT
+    if command -v apt-get > /dev/null; then
+        # Debian/Ubuntu
+        wget https://packages.microsoft.com/config/ubuntu/20.04/packages-microsoft-prod.deb -O packages-microsoft-prod.deb
+        dpkg -i packages-microsoft-prod.deb
+        rm packages-microsoft-prod.deb
+        apt-get update
+        apt-get install -y dotnet-sdk-6.0
+    elif command -v yum > /dev/null; then
+        # RHEL/CentOS/Oracle Linux
+        rpm -Uvh https://packages.microsoft.com/config/centos/7/packages-microsoft-prod.rpm
+        yum install -y dotnet-sdk-6.0
+    fi
+EOT
+
+# Установка Docker
+RUN <<EOT
+    if command -v apt-get > /dev/null; then
+        # Debian/Ubuntu
+        curl -fsSL https://get.docker.com | sh
+    elif command -v yum > /dev/null; then
+        # RHEL/CentOS/Oracle Linux
+        yum install -y yum-utils
+        yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+        yum install -y docker-ce docker-ce-cli containerd.io
+    fi
+    usermod -aG docker jenkins
+EOT
+
+FROM base as ansible-install
+
+RUN pip3 install --no-cache-dir \
+    ansible \
+    ansible-lint \
+    yamllint \
+    ansible-tower-cli \
+    jmespath \
+    netaddr
+
+FROM base as python-libs
+
+RUN pip3 install --no-cache-dir \
+    requests \
+    jinja2 \
+    pyyaml \
+    cryptography \
+    azure-identity \
+    boto3 \
+    google-auth \
+    psutil
+
+FROM base as final
+
+# Копируем установленные компоненты
+COPY --from=ansible-install /usr/local/lib/python3.9/dist-packages /usr/local/lib/python3.9/dist-packages
+COPY --from=ansible-install /usr/local/bin/ansible* /usr/local/bin/
+COPY --from=python-libs /usr/local/lib/python3.9/dist-packages /usr/local/lib/python3.9/dist-packages
+
+# Копируем .NET и PowerShell
+COPY --from=base /usr/share/dotnet /usr/share/dotnet
+COPY --from=base /usr/bin/pwsh /usr/bin/pwsh
+COPY --from=base /usr/bin/powershell /usr/bin/powershell
+
+# Настройка Kerberos для AD
+RUN mkdir -p /etc/krb5.conf.d
+COPY kerberos/krb5.conf /etc/krb5.conf
+
+# Создание структуры директорий для скриптов
+RUN <<EOT
+    mkdir -p /var/jenkins_conf/casc /var/ansible /shared
+    mkdir -p /usr/local/scripts/{groovy,powershell,python,bash}
+    chown -R jenkins:jenkins /var/jenkins_conf /var/ansible /shared /usr/local/scripts
+EOT
+
+# Копирование скриптов и библиотек
+COPY --chown=jenkins:jenkins scripts/ /var/jenkins_scripts/
+COPY --chown=jenkins:jenkins shared_scripts/ /usr/local/scripts/
+
+RUN chmod +x /var/jenkins_scripts/*.sh
+RUN chmod +x /usr/local/scripts/bash/*.sh
+RUN chmod +x /usr/local/scripts/python/*.py
+RUN chmod +x /usr/local/scripts/powershell/*.ps1
+
+# Создание симлинков для утилит
+RUN ln -sf /usr/bin/python3 /usr/bin/python
+
+# Установка плагинов через установленный скрипт
+RUN /usr/local/bin/install-plugins.sh < /usr/share/jenkins/ref/plugins.txt
+
+USER jenkins
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=1m --retries=3 \
+  CMD curl -f http://localhost:8080 || exit 1
+```
+
+Упрощенная версия Dockerfile для Oracle Linux
+
+Если предыдущий вариант слишком сложный, вот упрощенная версия только для Oracle Linux:
+
+```dockerfile
+# syntax=docker/dockerfile:1.4
+
+ARG JENKINS_VERSION=lts-jdk17
+
+FROM jenkins/jenkins:${JENKINS_VERSION} as base
+
+USER root
+
+LABEL security.scan="true" \
+      maintainer="devops@company.com" \
+      version="2.0" \
+      languages="java,groovy,python,powershell,bash,ansible"
+
+# Для Oracle Linux используем yum
+RUN <<EOT
+    # Обновление системы
+    yum update -y
+    
+    # Установка базовых утилит
+    yum install -y \
+        python3 \
+        python3-pip \
+        git \
+        sshpass \
+        openssh-clients \
+        curl \
+        gnupg2 \
+        jq \
+        unzip \
+        openldap-clients \
+        krb5-workstation \
+        krb5-libs \
+        sssd \
+        sssd-tools \
+        shellcheck \
+        nodejs \
+        npm \
+        maven
+    
+    # Установка Docker
+    yum install -y yum-utils
+    yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+    yum install -y docker-ce docker-ce-cli containerd.io
+    usermod -aG docker jenkins
+    
+    # Установка .NET SDK
+    rpm -Uvh https://packages.microsoft.com/config/centos/7/packages-microsoft-prod.rpm
+    yum install -y dotnet-sdk-6.0
+    
+    # Установка PowerShell
+    yum install -y powershell
+    
+    # Установка Groovy
+    curl -sSL https://archive.apache.org/dist/groovy/4.0.0/distribution/apache-groovy-binary-4.0.0.zip -o groovy.zip
+    unzip groovy.zip -d /opt
+    ln -s /opt/groovy-4.0.0/bin/groovy /usr/bin/groovy
+    ln -s /opt/groovy-4.0.0/bin/groovyc /usr/bin/groovyc
+    rm groovy.zip
+    
+    # Очистка кеша
+    yum clean all
+    rm -rf /var/cache/yum
+EOT
+
+# Установка Python библиотек
+RUN pip3 install --no-cache-dir \
+    ansible \
+    ansible-lint \
+    yamllint \
+    requests \
+    jinja2 \
+    pyyaml \
+    cryptography \
+    psutil
+
+# Настройка Kerberos для AD
+RUN mkdir -p /etc/krb5.conf.d
+COPY kerberos/krb5.conf /etc/krb5.conf
+
+# Создание структуры директорий
+RUN <<EOT
+    mkdir -p /var/jenkins_conf/casc /var/ansible /shared
+    mkdir -p /usr/local/scripts/{groovy,powershell,python,bash}
+    chown -R jenkins:jenkins /var/jenkins_conf /var/ansible /shared /usr/local/scripts
+EOT
+
+# Копирование скриптов
+COPY --chown=jenkins:jenkins scripts/ /var/jenkins_scripts/
+COPY --chown=jenkins:jenkins shared_scripts/ /usr/local/scripts/
+
+RUN chmod +x /var/jenkins_scripts/*.sh
+RUN chmod +x /usr/local/scripts/bash/*.sh
+RUN chmod +x /usr/local/scripts/python/*.py
+RUN chmod +x /usr/local/scripts/powershell/*.ps1
+
+# Создание симлинков
+RUN ln -sf /usr/bin/python3 /usr/bin/python
+
+# Установка плагинов Jenkins
+RUN /usr/local/bin/install-plugins.sh < /usr/share/jenkins/ref/plugins.txt
+
+USER jenkins
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=1m --retries=3 \
+  CMD curl -f http://localhost:8080 || exit 1
+```
+
+Скрипт для проверки окружения Oracle Linux
+
+scripts/check-oracle-linux.sh:
+
+```bash
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+log() {
+    echo -e "${GREEN}[INFO] $1${NC}"
+}
+
+warn() {
+    echo -e "${YELLOW}[WARN] $1${NC}"
+}
+
+error() {
+    echo -e "${RED}[ERROR] $1${NC}"
+}
+
+check_package_manager() {
+    log "Проверка пакетного менеджера..."
+    
+    if command -v yum &> /dev/null; then
+        log "✓ Найден yum (RHEL/Oracle Linux)"
+        return 0
+    elif command -v apt-get &> /dev/null; then
+        log "✓ Найден apt-get (Debian/Ubuntu)"
+        return 1
+    else
+        error "Не найден поддерживаемый пакетный менеджер"
+        exit 1
+    fi
+}
+
+check_installed_packages() {
+    log "Проверка установленных пакетов..."
+    
+    local packages=("python3" "git" "curl" "docker" "pwsh" "dotnet" "groovy")
+    
+    for pkg in "${packages[@]}"; do
+        if command -v "$pkg" &> /dev/null; then
+            log "✓ $pkg установлен"
+        else
+            warn "⚠ $pkg не установлен"
+        fi
+    done
+}
+
+check_python_libraries() {
+    log "Проверка Python библиотек..."
+    
+    local libs=("ansible" "requests" "psutil")
+    
+    for lib in "${libs[@]}"; do
+        if python3 -c "import $lib" &> /dev/null; then
+            log "✓ Python библиотека $lib установлена"
+        else
+            warn "⚠ Python библиотека $lib не установлена"
+        fi
+    done
+}
+
+check_jenkins_plugins() {
+    log "Проверка плагинов Jenkins..."
+    
+    if [[ -f /usr/share/jenkins/ref/plugins.txt ]]; then
+        log "✓ Файл plugins.txt найден"
+        local plugin_count=$(wc -l < /usr/share/jenkins/ref/plugins.txt)
+        log "✓ Найдено $plugin_count плагинов для установки"
+    else
+        warn "⚠ Файл plugins.txt не найден"
+    fi
+}
+
+main() {
+    log "Проверка окружения Oracle Linux..."
+    
+    check_package_manager
+    check_installed_packages
+    check_python_libraries
+    check_jenkins_plugins
+    
+    log "Проверка завершена!"
+}
+
+main "$@"
+```
+
+Обновленный docker-compose.yml для Oracle Linux
+
+```yaml
+name: jenkins-iac-corporate
+
+services:
+  jenkins:
+    build:
+      context: .
+      dockerfile: Dockerfile.oraclelinux  # Используем специальный Dockerfile для Oracle Linux
+      args:
+        JENKINS_VERSION: lts-jdk17
+    container_name: jenkins-iac-corporate
+    hostname: jenkins-iac
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "50000:50000"
+    environment:
+      JENKINS_OPTS: --httpPort=8080
+      CASC_JENKINS_CONFIG: /var/jenkins_conf/casc
+      JAVA_OPTS: -Djenkins.install.runSetupWizard=false -Xmx2g -Xms512m -Duser.timezone=Europe/Moscow -Dcom.sun.jndi.ldap.object.disableEndpointIdentification=true
+      JENKINS_SLAVE_AGENT_PORT: 50000
+    env_file:
+      - .env
+    volumes:
+      - jenkins_data:/var/jenkins_home
+      - ansible_data:/var/ansible
+      - ./casc:/var/jenkins_conf/casc:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./scripts:/var/jenkins_scripts:ro
+      - ./shared_scripts:/usr/local/scripts:ro
+      - ./shared:/shared:rw
+      - ./kerberos/krb5.conf:/etc/krb5.conf:ro
+    networks:
+      jenkins-network:
+        aliases:
+          - jenkins-main
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    configs:
+      - source: plugins_txt
+        target: /usr/share/jenkins/ref/plugins.txt
+    secrets:
+      - source: admin_password
+        target: /run/secrets/jenkins_admin_password
+      - source: smtp_password
+        target: /run/secrets/smtp_password
+      - source: ad_bind_password
+        target: /run/secrets/ad_bind_password
+
+networks:
+  jenkins-network:
+    name: jenkins-corporate-network
+    driver: bridge
+
+volumes:
+  jenkins_data:
+    name: jenkins_corporate_data
+  ansible_data:
+    name: ansible_corporate_data
+
+configs:
+  plugins_txt:
+    file: ./plugins.txt
+
+secrets:
+  admin_password:
+    file: ./secrets/jenkins_admin_password.txt
+  smtp_password:
+    file: ./secrets/smtp_password.txt
+  ad_bind_password:
+    file: ./secrets/ad_bind_password.txt
+```
+
+Инструкция для Oracle Linux
+
+1. Создаем специальный Dockerfile для Oracle Linux
+
+Сохраните упрощенную версию как Dockerfile.oraclelinux
+
+2. Обновляем deploy.sh для определения ОС
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ... остальной код ...
+
+detect_os_and_set_dockerfile() {
+    log "Определение операционной системы..."
+    
+    if [[ -f /etc/oracle-release ]]; then
+        log "Обнаружена Oracle Linux"
+        export DOCKERFILE="Dockerfile.oraclelinux"
+    elif [[ -f /etc/redhat-release ]]; then
+        log "Обнаружена RHEL/CentOS"
+        export DOCKERFILE="Dockerfile.oraclelinux"
+    elif [[ -f /etc/debian_version ]]; then
+        log "Обнаружена Debian/Ubuntu"
+        export DOCKERFILE="Dockerfile"
+    else
+        warn "Не удалось определить ОС, используется стандартный Dockerfile"
+        export DOCKERFILE="Dockerfile"
+    fi
+    
+    log "Используется Dockerfile: $DOCKERFILE"
+}
+
+build_images() {
+    log "Сборка Docker образов..."
+    docker compose build --pull --no-cache
+}
+
+# В main функции добавляем вызов
+main() {
+    detect_os_and_set_dockerfile
+    # ... остальной код
+}
+```
+
+3. Запуск на Oracle Linux
+
+```bash
+# Делаем скрипты исполняемыми
+chmod +x scripts/*.sh
+
+# Проверяем окружение
+./scripts/check-oracle-linux.sh
+
+# Запускаем деплой
+./deploy.sh
+```
+
+Решение проблем с .NET SDK на Oracle Linux
+
+Если проблемы с .NET SDK сохраняются, можно исключить его установку и использовать только PowerShell:
+
+```dockerfile
+# Альтернатива - устанавливаем только PowerShell без .NET SDK
+RUN yum install -y powershell
+
+# Или устанавливаем .NET Runtime вместо SDK (меньше зависимостей)
+RUN yum install -y aspnetcore-runtime-6.0
+```
+
+Теперь Dockerfile должен работать корректно на Oracle Linux, используя правильные пакетные менеджеры и репозитории для этого дистрибутива.

@@ -392,3 +392,225 @@ docker images
 4. Документация: Ведите документацию по изменениям конфигурации
 
 Выберите вариант, который наиболее соответствует вашим требованиям по безопасности, производительности и функциональности.
+
+Когда Nexus использует 443 порт (стандартный HTTPS порт), конфигурация значительно упрощается, так как не требуется настраивать insecure-registries. Вот оптимальные варианты:
+
+🎯 Вариант 1: Базовая конфигурация для HTTPS
+
+```json
+{
+  "registry-mirrors": [],
+  "debug": false,
+  "log-level": "info",
+  "storage-driver": "overlay2",
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "50m",
+    "max-file": "3"
+  },
+  "live-restore": true,
+  "max-concurrent-downloads": 10,
+  "experimental": false
+}
+```
+
+🔐 Вариант 2: С настроенными сертификатами
+
+```json
+{
+  "debug": false,
+  "log-level": "warn",
+  "storage-driver": "overlay2",
+  "data-root": "/var/lib/docker",
+  "exec-opts": [
+    "native.cgroupdriver=systemd"
+  ],
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m",
+    "max-file": "3"
+  },
+  "live-restore": true,
+  "max-concurrent-downloads": 20,
+  "max-concurrent-uploads": 10,
+  "tlsverify": true,
+  "tlscacert": "/etc/docker/certs/ca.pem",
+  "tlscert": "/etc/docker/certs/client-cert.pem",
+  "tlskey": "/etc/docker/certs/client-key.pem"
+}
+```
+
+🚀 Вариант 3: Высокопроизводительная настройка
+
+```json
+{
+  "registry-mirrors": [
+    "https://nexus.company.com"
+  ],
+  "debug": false,
+  "log-level": "error",
+  "storage-driver": "overlay2",
+  "storage-opts": [
+    "overlay2.override_kernel_check=true",
+    "overlay2.size=50G"
+  ],
+  "data-root": "/opt/docker",
+  "bip": "172.26.0.1/16",
+  "max-concurrent-downloads": 20,
+  "max-concurrent-uploads": 10,
+  "max-download-attempts": 5,
+  "dns": ["8.8.8.8", "8.8.4.4"],
+  "dns-opts": ["timeout:2", "attempts:3"],
+  "live-restore": true,
+  "exec-opts": [
+    "native.cgroupdriver=systemd"
+  ],
+  "features": {
+    "buildkit": true
+  }
+}
+```
+
+📝 Настройка аутентификации для порта 443:
+
+1. Docker login (рекомендуется):
+
+```bash
+docker login nexus.company.com
+# Или с явным указанием порта 443
+docker login nexus.company.com:443
+```
+
+2. Ручная настройка в ~/.docker/config.json:
+
+```json
+{
+  "auths": {
+    "nexus.company.com": {
+      "auth": "dXNlcm5hbWU6cGFzc3dvcmQ="
+    },
+    "nexus.company.com:443": {
+      "auth": "dXNlcm5hbWU6cGFzc3dvcmQ="
+    }
+  },
+  "credsStore": "secretservice"
+}
+```
+
+🔧 Вариант 4: Минималистичный для продакшн
+
+```json
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  },
+  "storage-driver": "overlay2",
+  "live-restore": true
+}
+```
+
+⚙️ Настройка сертификатов для HTTPS:
+
+Если используется самоподписанный сертификат:
+
+```bash
+# Создание директории для сертификатов
+sudo mkdir -p /etc/docker/certs.d/nexus.company.com
+
+# Копирование CA сертификата
+sudo cp nexus-ca.crt /etc/docker/certs.d/nexus.company.com/ca.crt
+
+# Или для порта 443 явно
+sudo mkdir -p /etc/docker/certs.d/nexus.company.com:443
+sudo cp nexus-ca.crt /etc/docker/certs.d/nexus.company.com:443/ca.crt
+```
+
+🛠️ Автоматический скрипт настройки:
+
+```bash
+#!/bin/bash
+# setup-docker-nexus-443.sh
+
+NEXUS_HOST="nexus.company.com"
+USERNAME="docker-user"
+PASSWORD="your-password"
+
+# Создаем daemon.json для HTTPS
+sudo tee /etc/docker/daemon.json <<EOF
+{
+  "debug": false,
+  "log-level": "info",
+  "storage-driver": "overlay2",
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "50m",
+    "max-file": "3"
+  },
+  "live-restore": true
+}
+EOF
+
+# Логин в registry (создаст запись в ~/.docker/config.json)
+docker login $NEXUS_HOST -u $USERNAME -p $PASSWORD
+
+# Перезапускаем Docker
+sudo systemctl daemon-reload
+sudo systemctl restart docker
+
+echo "Docker настроен для работы с Nexus по HTTPS (порт 443)"
+```
+
+🔄 Проверка подключения:
+
+```bash
+# Проверить доступность Nexus
+curl -I https://nexus.company.com
+
+# Тестовый логин
+docker login nexus.company.com
+
+# Проверить образы
+curl -u username:password https://nexus.company.com/v2/_catalog
+
+# Проверить конфигурацию Docker
+docker system info
+```
+
+🎪 Вариант 5: Для Docker Swarm с HTTPS
+
+```json
+{
+  "tls": true,
+  "tlscacert": "/etc/docker/ssl/ca.pem",
+  "tlscert": "/etc/docker/ssl/server-cert.pem",
+  "tlskey": "/etc/docker/ssl/server-key.pem",
+  "tlsverify": true,
+  "cluster-store": "consul://127.0.0.1:8500",
+  "cluster-advertise": "eth0:2376",
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m",
+    "max-file": "3"
+  },
+  "storage-driver": "overlay2",
+  "live-restore": true
+}
+```
+
+💡 Ключевые преимущества порта 443:
+
+· ✅ Не требуется insecure-registries
+· ✅ Стандартный HTTPS порт
+· ✅ Работает через корпоративные прокси
+· ✅ Более безопасная конфигурация
+· ✅ Проще настройка CI/CD
+
+Важно: При использовании порта 443 убедитесь, что:
+
+· DNS имя корректно разрешается
+· SSL сертификат валиден (или добавлен в доверенные)
+· Брандмауэр разрешает исходящие подключения на 443 порт
+
+Выберите вариант, который лучше всего подходит для вашей среды!

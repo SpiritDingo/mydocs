@@ -125,3 +125,270 @@ docker pull nexus.local:8082/your-image:tag
 · Проверьте логи: journalctl -u docker -f
 
 Эта конфигурация обеспечит надежное подключение Docker к вашему локальному Nexus repository с поддержкой авторизации.
+
+
+Вот дополнительные варианты конфигурации daemon.json для подключения к Nexus:
+
+🏢 Вариант 2: Для корпоративной среды с несколькими registry
+
+```json
+{
+  "insecure-registries": [
+    "nexus.company.local:8082",
+    "nexus.company.local:8083",
+    "registry.internal:5000"
+  ],
+  "registry-mirrors": [
+    "https://mirror.gcr.io",
+    "https://registry.docker-cn.com"
+  ],
+  "debug": false,
+  "log-level": "warn",
+  "storage-driver": "overlay2",
+  "data-root": "/var/lib/docker",
+  "exec-opts": [
+    "native.cgroupdriver=systemd"
+  ],
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m",
+    "max-file": "3",
+    "labels": "production"
+  },
+  "live-restore": true,
+  "max-concurrent-downloads": 10,
+  "max-concurrent-uploads": 5,
+  "default-address-pools": [
+    {
+      "base": "172.80.0.0/12",
+      "size": 24
+    }
+  ]
+}
+```
+
+🔐 Вариант 3: С безопасной аутентификацией через отдельный конфиг
+
+/etc/docker/daemon.json:
+
+```json
+{
+  "insecure-registries": [
+    "nexus.local:8082"
+  ],
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "50m",
+    "max-file": "5"
+  },
+  "storage-driver": "overlay2",
+  "storage-opts": [
+    "overlay2.override_kernel_check=true"
+  ],
+  "mtu": 1500,
+  "ipv6": false,
+  "fixed-cidr-v6": "2001:db8:1::/64",
+  "experimental": false,
+  "metrics-addr": "127.0.0.1:9323",
+  "live-restore": true
+}
+```
+
+Отдельный файл аутентификации /root/.docker/config.json:
+
+```json
+{
+  "auths": {
+    "nexus.local:8082": {
+      "auth": "dXNlcm5hbWU6cGFzc3dvcmQ="
+    },
+    "nexus.local:8083": {
+      "auth": "YWRtaW46cGFzc3dvcmQ="
+    }
+  },
+  "HttpHeaders": {
+    "User-Agent": "Docker-Client/19.03.12 (linux)"
+  },
+  "credsStore": "pass"
+}
+```
+
+🐳 Вариант 4: Для Docker Swarm с TLS
+
+```json
+{
+  "insecure-registries": [
+    "nexus-swarm.local:8082"
+  ],
+  "tls": true,
+  "tlscacert": "/etc/docker/ssl/ca.pem",
+  "tlscert": "/etc/docker/ssl/server-cert.pem",
+  "tlskey": "/etc/docker/ssl/server-key.pem",
+  "tlsverify": true,
+  "cluster-store": "consul://127.0.0.1:8500",
+  "cluster-advertise": "eth0:2376",
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m",
+    "max-file": "3"
+  },
+  "storage-driver": "overlay2",
+  "storage-opts": [
+    "overlay2.override_kernel_check=true",
+    "overlay2.size=50G"
+  ],
+  "default-ulimits": {
+    "nofile": {
+      "Name": "nofile",
+      "Hard": 65536,
+      "Soft": 65536
+    }
+  }
+}
+```
+
+🚀 Вариант 5: Высокопроизводительная настройка
+
+```json
+{
+  "insecure-registries": [
+    "nexus-perf.local:8082"
+  ],
+  "registry-mirrors": [
+    "https://registry-1.docker.io",
+    "https://mirror.gcr.io"
+  ],
+  "debug": false,
+  "log-level": "error",
+  "storage-driver": "overlay2",
+  "storage-opts": [
+    "overlay2.override_kernel_check=true",
+    "overlay2.size=100G"
+  ],
+  "data-root": "/opt/docker",
+  "bip": "172.26.0.1/16",
+  "default-address-pools": [
+    {
+      "base": "172.80.0.0/12",
+      "size": 24
+    }
+  ],
+  "max-concurrent-downloads": 20,
+  "max-concurrent-uploads": 10,
+  "max-download-attempts": 5,
+  "dns": ["8.8.8.8", "8.8.4.4"],
+  "dns-opts": ["timeout:2", "attempts:3"],
+  "live-restore": true,
+  "oom-score-adjust": -500,
+  "exec-opts": [
+    "native.cgroupdriver=systemd"
+  ],
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "200m",
+    "max-file": "5",
+    "compress": "true"
+  },
+  "features": {
+    "buildkit": true
+  },
+  "builder": {
+    "gc": {
+      "enabled": true,
+      "defaultKeepStorage": "20GB"
+    }
+  }
+}
+```
+
+🔧 Вариант 6: Минималистичный для разработки
+
+```json
+{
+  "insecure-registries": ["nexus-dev:8082"],
+  "storage-driver": "overlay2",
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  }
+}
+```
+
+📝 Скрипт для автоматической настройки:
+
+```bash
+#!/bin/bash
+# setup-docker-nexus.sh
+
+NEXUS_HOST="nexus.local"
+NEXUS_PORT="8082"
+USERNAME="docker-user"
+PASSWORD="your-password"
+
+# Создаем директорию для сертификатов
+sudo mkdir -p /etc/docker/certs.d/${NEXUS_HOST}:${NEXUS_PORT}
+
+# Генерируем auth token
+AUTH_TOKEN=$(echo -n "${USERNAME}:${PASSWORD}" | base64)
+
+# Создаем daemon.json
+sudo tee /etc/docker/daemon.json <<EOF
+{
+  "insecure-registries": ["${NEXUS_HOST}:${NEXUS_PORT}"],
+  "debug": false,
+  "log-level": "info",
+  "storage-driver": "overlay2",
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "50m",
+    "max-file": "3"
+  }
+}
+EOF
+
+# Создаем конфиг аутентификации
+mkdir -p ~/.docker
+cat > ~/.docker/config.json <<EOF
+{
+  "auths": {
+    "${NEXUS_HOST}:${NEXUS_PORT}": {
+      "auth": "${AUTH_TOKEN}"
+    }
+  }
+}
+EOF
+
+# Перезапускаем Docker
+sudo systemctl daemon-reload
+sudo systemctl restart docker
+
+echo "Docker настроен для работы с Nexus ${NEXUS_HOST}:${NEXUS_PORT}"
+```
+
+🔍 Проверка конфигурации:
+
+После применения любой конфигурации проверьте:
+
+```bash
+# Проверить текущую конфигурацию
+docker system info
+
+# Проверить подключение к Nexus
+curl -X GET http://nexus.local:8082/v2/_catalog
+
+# Тестовый логин
+docker login nexus.local:8082
+
+# Проверить образы в registry
+docker images
+```
+
+⚠️ Важные замечания:
+
+1. Безопасность: Не используйте insecure-registries в продакшн среде
+2. Бэкап: Сохраняйте резервные копии конфигурационных файлов
+3. Тестирование: Всегда тестируйте конфигурацию в dev-среде
+4. Документация: Ведите документацию по изменениям конфигурации
+
+Выберите вариант, который наиболее соответствует вашим требованиям по безопасности, производительности и функциональности.

@@ -632,3 +632,291 @@ curl -I https://${JENKINS_DOMAIN}
 4. Упрощен docker-compose.yml - убраны лишние volume mounts
 
 Теперь nginx будет правильно разрешать адрес Jenkins и ошибка с портом исчезнет.
+
+
+Исправлю проблему с правами доступа для Jenkins. Это распространенная проблема при монтировании томов.
+
+Обновленный docker-compose.yml
+
+```yaml
+version: '3.8'
+
+services:
+  jenkins:
+    image: jenkins/jenkins:${JENKINS_VERSION:-latest}
+    container_name: jenkins
+    restart: unless-stopped
+    hostname: ${JENKINS_DOMAIN:-jenkins.company.com}
+    user: "1000:1000"  # Запуск от текущего пользователя
+    environment:
+      - JAVA_OPTS=-Djenkins.install.runSetupWizard=false -Djavax.net.ssl.trustStore=/var/jenkins_certs/truststore.jks -Djavax.net.ssl.trustStorePassword=changeit
+      - JENKINS_OPTS=--httpPort=8080
+    volumes:
+      - ${JENKINS_DATA:-./jenkins_home}:/var/jenkins_home
+      - ${CERTS_DIR:-./certs}:/var/jenkins_certs:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - jenkins-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  nginx:
+    build: 
+      context: ./nginx
+      dockerfile: Dockerfile
+    container_name: nginx-proxy
+    restart: unless-stopped
+    ports:
+      - "${NGINX_HTTP_PORT:-80}:80"
+      - "${NGINX_HTTPS_PORT:-443}:443"
+    environment:
+      - JENKINS_BACKEND=jenkins:8080
+      - JENKINS_DOMAIN=${JENKINS_DOMAIN:-jenkins.company.com}
+    volumes:
+      - ${CERTS_DIR:-./certs}:/etc/nginx/certs:ro
+    depends_on:
+      - jenkins
+    networks:
+      - jenkins-network
+
+networks:
+  jenkins-network:
+    driver: bridge
+
+volumes:
+  jenkins_data:
+    driver: local
+```
+
+Скрипт настройки прав (scripts/setup-permissions.sh)
+
+```bash
+#!/bin/bash
+
+set -e
+
+echo "Setting up permissions for Jenkins..."
+
+JENKINS_DATA_DIR=${JENKINS_DATA:-./jenkins_home}
+CERTS_DIR=${CERTS_DIR:-./certs}
+
+# Создаем директории
+mkdir -p $JENKINS_DATA_DIR
+mkdir -p $CERTS_DIR
+mkdir -p nginx
+
+# Получаем ID текущего пользователя
+CURRENT_UID=$(id -u)
+CURRENT_GID=$(id -g)
+
+echo "Current user: $USER (UID: $CURRENT_UID, GID: $CURRENT_GID)"
+
+# Устанавливаем правильные права на директории
+echo "Setting ownership for Jenkins data directory..."
+sudo chown -R $CURRENT_UID:$CURRENT_GID $JENKINS_DATA_DIR
+sudo chmod -R 755 $JENKINS_DATA_DIR
+
+echo "Setting ownership for certificates directory..."
+sudo chown -R $CURRENT_UID:$CURRENT_GID $CERTS_DIR
+sudo chmod -R 755 $CERTS_DIR
+
+# Создаем необходимые поддиректории в Jenkins home
+mkdir -p $JENKINS_DATA_DIR/plugins
+mkdir -p $JENKINS_DATA_DIR/jobs
+mkdir -p $JENKINS_DATA_DIR/users
+mkdir -p $JENKINS_DATA_DIR/secrets
+mkdir -p $JENKINS_DATA_DIR/init.groovy.d
+
+echo "Permissions setup completed!"
+```
+
+Обновленный скрипт инициализации (scripts/init.sh)
+
+```bash
+#!/bin/bash
+
+set -e
+
+echo "Starting Jenkins infrastructure initialization..."
+
+# Настройка прав
+echo "=== Setting up permissions ==="
+./scripts/setup-permissions.sh
+
+# Настройка сертификатов
+echo "=== Setting up certificates ==="
+./scripts/setup-certs.sh
+
+# Сборка nginx образа
+echo "=== Building nginx image ==="
+docker build -t jenkins-nginx ./nginx
+
+echo "=== Starting services ==="
+docker-compose up -d
+
+echo "=== Waiting for Jenkins to start ==="
+sleep 30
+
+echo "=== Checking services status ==="
+docker-compose ps
+
+echo "=== Jenkins initialization completed! ==="
+echo "Jenkins URL: https://${JENKINS_DOMAIN:-jenkins.company.com}"
+echo "To get initial admin password, run: docker exec jenkins cat /var/jenkins_home/secrets/initialAdminPassword"
+```
+
+Альтернативное решение с Dockerfile для Jenkins
+
+Если проблема с правами persists, создайте кастомный образ:
+
+jenkins/Dockerfile
+
+```dockerfile
+FROM jenkins/jenkins:latest
+
+# Переключаемся на root для настройки прав
+USER root
+
+# Создаем директорию и устанавливаем правильные права
+RUN mkdir -p /var/jenkins_home \
+    && chown -R jenkins:jenkins /var/jenkins_home \
+    && chmod -R 755 /var/jenkins_home
+
+# Устанавливаем дополнительные утилиты
+RUN apt-get update && apt-get install -y \
+    curl \
+    wget \
+    git \
+    unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Возвращаемся к пользователю jenkins
+USER jenkins
+```
+
+Обновленный docker-compose.yml с кастомным образом
+
+```yaml
+version: '3.8'
+
+services:
+  jenkins:
+    build: 
+      context: ./jenkins
+      dockerfile: Dockerfile
+    container_name: jenkins
+    restart: unless-stopped
+    hostname: ${JENKINS_DOMAIN:-jenkins.company.com}
+    environment:
+      - JAVA_OPTS=-Djenkins.install.runSetupWizard=false -Djavax.net.ssl.trustStore=/var/jenkins_certs/truststore.jks -Djavax.net.ssl.trustStorePassword=changeit
+      - JENKINS_OPTS=--httpPort=8080
+    volumes:
+      - ${JENKINS_DATA:-./jenkins_home}:/var/jenkins_home
+      - ${CERTS_DIR:-./certs}:/var/jenkins_certs:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - jenkins-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  nginx:
+    build: 
+      context: ./nginx
+      dockerfile: Dockerfile
+    container_name: nginx-proxy
+    restart: unless-stopped
+    ports:
+      - "${NGINX_HTTP_PORT:-80}:80"
+      - "${NGINX_HTTPS_PORT:-443}:443"
+    environment:
+      - JENKINS_BACKEND=jenkins:8080
+      - JENKINS_DOMAIN=${JENKINS_DOMAIN:-jenkins.company.com}
+    volumes:
+      - ${CERTS_DIR:-./certs}:/etc/nginx/certs:ro
+    depends_on:
+      - jenkins
+    networks:
+      - jenkins-network
+
+networks:
+  jenkins-network:
+    driver: bridge
+```
+
+Обновленная структура проекта
+
+```
+jenkins-corporate/
+├── .env
+├── docker-compose.yml
+├── jenkins/
+│   └── Dockerfile
+├── nginx/
+│   ├── Dockerfile
+│   ├── docker-entrypoint.sh
+│   └── nginx.conf.template
+├── scripts/
+│   ├── init.sh
+│   ├── setup-permissions.sh
+│   └── setup-certs.sh
+├── jenkins_home/
+└── certs/
+```
+
+Инструкция развертывания
+
+1. Создайте структуру директорий:
+
+```bash
+mkdir -p jenkins nginx scripts jenkins_home certs
+```
+
+1. Сделайте скрипты исполняемыми:
+
+```bash
+chmod +x scripts/*.sh
+chmod +x nginx/docker-entrypoint.sh
+```
+
+1. Запустите полную инициализацию:
+
+```bash
+./scripts/init.sh
+```
+
+1. Если все еще есть проблемы с правами, используйте кастомный образ Jenkins:
+
+```bash
+# Создайте jenkins/Dockerfile как указано выше
+# Затем пересоберите и запустите
+docker-compose down
+docker-compose build --no-cache jenkins
+docker-compose up -d
+```
+
+Альтернативное быстрое решение
+
+Если нужно быстрое решение, можно временно запустить Jenkins от root:
+
+```yaml
+jenkins:
+  image: jenkins/jenkins:latest
+  container_name: jenkins
+  user: "root"  # Временное решение для разработки
+  # ... остальная конфигурация
+```
+
+Ключевые исправления:
+
+1. Указан пользователь в docker-compose.yml
+2. Скрипт настройки прав для корректного владения директориями
+3. Кастомный Dockerfile для Jenkins как альтернативное решение
+4. Полный скрипт инициализации который обрабатывает все этапы настройки
+
+После применения этих исправлений проблема с правами доступа должна быть решена.

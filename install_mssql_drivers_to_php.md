@@ -124,3 +124,83 @@ echo "Connected successfully!";
    ```
 
 Готово! Теперь у вас установлены драйверы sqlsrv и pdo_sqlsrv для PHP 8.0 на Oracle Linux 9.
+
+
+Ошибка cannot find -lltdl указывает на отсутствие библиотеки libtool-ltdl. Вот решения:
+
+Способ 1: Установка недостающих зависимостей
+
+```bash
+# Установка необходимых библиотек для компиляции
+sudo dnf install libtool-ltdl-devel unixODBC-devel gcc-c++ make
+```
+
+Способ 2: Установка полного набора инструментов разработки
+
+```bash
+# Установка групп разработки
+sudo dnf groupinstall "Development Tools"
+sudo dnf install libtool-ltdl-devel unixODBC-devel
+```
+
+Способ 3: Поиск и установка конкретного пакета
+
+```bash
+# Поиск пакета, предоставляющего библиотеку ltdl
+dnf provides "*/libltdl.so*"
+
+# Установка найденного пакета
+sudo dnf install libtool-ltdl
+```
+
+Способ 4: Для PHP расширений Microsoft SQL Server
+
+Если вы компилируете sqlsrv или pdo_sqlsrv, установите все зависимости:
+
+```bash
+sudo dnf install \
+    libtool-ltdl-devel \
+    unixODBC-devel \
+    gcc-c++ \
+    make \
+    php-devel \
+    openssl-devel
+```
+
+Способ 5: Проверка установленных библиотек
+
+```bash
+# Проверяем наличие библиотек
+ldconfig -p | grep ltdl
+find /usr -name "libltdl*" 2>/dev/null
+```
+
+После установки зависимостей:
+
+```bash
+# Повторяем сборку
+pecl install sqlsrv
+# или
+phpize && ./configure && make && sudo make install
+```
+
+Дополнительные рекомендации:
+
+1. Очистите кеш сборки:
+   ```bash
+   make clean
+   phpize --clean
+   ```
+2. Если используете PECL:
+   ```bash
+   pecl uninstall sqlsrv
+   pecl install sqlsrv
+   ```
+3. Проверьте версии:
+   ```bash
+   gcc --version
+   make --version
+   php -v
+   ```
+
+Наиболее вероятное решение - выполнить Способ 1 или 2, чтобы установить все необходимые инструменты разработки и библиотеки.

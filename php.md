@@ -115,3 +115,71 @@ sudo dnf install php-pgsql php-sqlite3 php-bcmath php-soap php-pecl-mcrypt -y
 ```
 
 Теперь у вас должен быть полностью настроенный веб-сервер с PHP 8 на Oracle Linux 9.
+
+
+
+Ошибка возникает из-за конфликта версий PHP между установленными пакетами. Вот несколько способов решения:
+
+Способ 1: Полное переключение на PHP 8.1 (рекомендуется)
+
+```bash
+# Удаляем конфликтующие пакеты PHP 8.0
+sudo dnf remove php-common-8.0.* php-pecl-ssh2
+
+# Устанавливаем PHP 8.1 и необходимые расширения
+sudo dnf install php php-common php-pecl-zip php-pecl-ssh2
+```
+
+Способ 2: Использование модулей PHP
+
+```bash
+# Смотрим доступные модули PHP
+dnf module list php
+
+# Переключаемся на PHP 8.1
+sudo dnf module reset php
+sudo dnf module enable php:8.1
+sudo dnf update php-common php-pecl-zip php-pecl-ssh2
+```
+
+Способ 3: Принудительное обновление с заменой пакетов
+
+```bash
+sudo dnf update --allowerasing
+```
+
+Способ 4: Если нужно сохранить PHP 8.0
+
+```bash
+# Удаляем проблемные пакеты
+sudo dnf remove php-pecl-ssh2 php-pecl-zip
+
+# Переустанавливаем PHP 8.0 и расширения
+sudo dnf install php php-common php-pecl-zip php-pecl-ssh2
+```
+
+Способ 5: Очистка и переустановка
+
+```bash
+# Удаляем все PHP пакеты
+sudo dnf remove php*
+
+# Очищаем кеш
+sudo dnf clean all
+
+# Устанавливаем PHP заново
+sudo dnf install php php-common php-pecl-zip php-pecl-ssh2
+```
+
+Проверка после решения:
+
+```bash
+# Проверяем версию PHP
+php -v
+
+# Проверяем установленные модули
+php -m | grep zip
+php -m | grep ssh2
+```
+
+Рекомендую использовать Способ 1 или 2 - они наиболее безопасны и правильно разрешают конфликт версий. PHP 8.1 обычно предпочтительнее, так как это более новая версия с улучшенной производительностью и безопасностью.

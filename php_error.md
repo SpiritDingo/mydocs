@@ -337,3 +337,235 @@ sudo netstat -tlnp | grep php
 ```
 
 После выполнения этих шагов Nextcloud должен работать корректно. Если проблема сохраняется, проверьте версию PHP и убедитесь, что все пакеты совместимы.
+
+
+
+Вот подробная инструкция по настройке Apache для Nextcloud с PHP-FPM:
+
+1. Установка необходимых компонентов
+
+Для Ubuntu/Debian:
+
+```bash
+sudo apt update
+sudo apt install apache2 php-fpm php-curl php-cli php-mysqlnd \
+php-gd php-json php-curl php-zip php-xml php-mbstring php-bz2 \
+php-intl php-gmp php-bcmath php-imagick libapache2-mod-php
+```
+
+Для CentOS/RHEL:
+
+```bash
+sudo yum install httpd php-fpm php-curl php-cli php-mysqlnd \
+php-gd php-json php-common php-zip php-xml php-mbstring \
+php-bz2 php-intl php-gmp php-bcmath php-pecl-imagick
+```
+
+2. Включение необходимых модулей Apache
+
+```bash
+# Ubuntu/Debian
+sudo a2enmod proxy_fcgi setenvif rewrite headers env dir mime
+sudo a2enconf php8.1-fpm  # Замените на вашу версию PHP
+
+# CentOS/RHEL
+sudo systemctl enable --now httpd php-fpm
+```
+
+3. Настройка PHP-FPM
+
+Проверьте конфигурацию PHP-FPM:
+
+```bash
+sudo nano /etc/php/8.1/fpm/pool.d/www.conf  # Ubuntu/Debian
+sudo nano /etc/php-fpm.d/www.conf           # CentOS/RHEL
+```
+
+Убедитесь, что есть следующие настройки:
+
+```ini
+; Использование сокета
+listen = /run/php/php8.1-fpm.sock
+
+; Или использование TCP
+; listen = 127.0.0.1:9000
+
+listen.owner = www-data
+listen.group = www-data
+listen.mode = 0660
+
+user = www-data
+group = www-data
+
+pm = dynamic
+pm.max_children = 50
+pm.start_servers = 5
+pm.min_spare_servers = 5
+pm.max_spare_servers = 35
+```
+
+4. Конфигурация виртуального хоста Apache
+
+Создайте файл конфигурации для Nextcloud:
+
+Ubuntu/Debian:
+
+```bash
+sudo nano /etc/apache2/sites-available/nextcloud.conf
+```
+
+CentOS/RHEL:
+
+```bash
+sudo nano /etc/httpd/conf.d/nextcloud.conf
+```
+
+Содержимое конфигурационного файла:
+
+```apache
+<VirtualHost *:80>
+    ServerName your-domain.com
+    ServerAdmin admin@your-domain.com
+    
+    # Основная директория Nextcloud
+    DocumentRoot /var/www/nextcloud
+    
+    # Логи
+    ErrorLog ${APACHE_LOG_DIR}/nextcloud_error.log
+    CustomLog ${APACHE_LOG_DIR}/nextcloud_access.log combined
+    
+    # Настройки директории
+    <Directory /var/www/nextcloud/>
+        Options +FollowSymlinks
+        AllowOverride All
+        
+        <IfModule mod_dav.c>
+            Dav off
+        </IfModule>
+        
+        SetEnv HOME /var/www/nextcloud
+        SetEnv HTTP_HOME /var/www/nextcloud
+        
+        # Базовые настройки доступа
+        Require all granted
+    </Directory>
+    
+    # Обработка PHP через FPM с использованием сокета
+    <FilesMatch \.php$>
+        SetHandler "proxy:unix:/run/php/php8.1-fpm.sock|fcgi://localhost"
+    </FilesMatch>
+    
+    # Альтернатива: использование TCP
+    # <FilesMatch \.php$>
+    #    SetHandler "proxy:fcgi://127.0.0.1:9000"
+    # </FilesMatch>
+    
+    # Настройки Proxy для FPM
+    ProxyPassMatch "^/(.*\.php)$" "unix:/run/php/php8.1-fpm.sock|fcgi://localhost/var/www/nextcloud"
+    
+    # Безопасность заголовков
+    <IfModule mod_headers.c>
+        Header always set Strict-Transport-Security "max-age=15552000; includeSubDomains"
+        Header always set Referrer-Policy "no-referrer"
+        Header always set X-Content-Type-Options "nosniff"
+        Header always set X-Download-Options "noopen"
+        Header always set X-Frame-Options "SAMEORIGIN"
+        Header always set X-Permitted-Cross-Domain-Policies "none"
+        Header always set X-Robots-Tag "none"
+        Header always set X-XSS-Protection "1; mode=block"
+    </IfModule>
+    
+    # Перезапись URL
+    RewriteEngine On
+    <IfModule mod_rewrite.c>
+        RewriteRule .* - [env=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+    </IfModule>
+</VirtualHost>
+```
+
+5. Настройка прав доступа к файлам
+
+```bash
+# Установите правильного владельца
+sudo chown -R www-data:www-data /var/www/nextcloud
+
+# Установите правильные права
+sudo chmod -R 755 /var/www/nextcloud
+sudo chmod -R 750 /var/www/nextcloud/config/
+sudo chmod -R 750 /var/www/nextcloud/apps/
+sudo chmod -R 750 /var/www/nextcloud/data/
+```
+
+6. Активация сайта и перезапуск служб
+
+Ubuntu/Debian:
+
+```bash
+sudo a2ensite nextcloud.conf
+sudo a2dissite 000-default.conf  # Отключить default сайт если нужно
+sudo systemctl restart apache2 php8.1-fpm
+```
+
+CentOS/RHEL:
+
+```bash
+sudo systemctl restart httpd php-fpm
+sudo systemctl enable httpd php-fpm
+```
+
+7. Дополнительные настройки безопасности
+
+Добавьте в конфигурацию Apache:
+
+```apache
+# Запрет доступа к чувствительным файлам
+<Directory /var/www/nextcloud/data>
+    Require all denied
+</Directory>
+
+<Directory /var/www/nextcloud/config>
+    Require all denied
+</Directory>
+
+<FilesMatch "\.(md|db|sql|sh|log)$">
+    Require all denied
+</FilesMatch>
+
+# Настройки для больших файлов
+LimitRequestBody 0
+<IfModule mod_php.c>
+    php_value upload_max_filesize 10G
+    php_value post_max_size 10G
+    php_value memory_limit 512M
+    php_value max_execution_time 3600
+    php_value max_input_time 3600
+</IfModule>
+```
+
+8. Проверка конфигурации
+
+```bash
+# Проверка синтаксиса Apache
+sudo apache2ctl configtest  # Ubuntu/Debian
+sudo httpd -t              # CentOS/RHEL
+
+# Проверка статуса служб
+sudo systemctl status apache2
+sudo systemctl status php8.1-fpm
+
+# Проверка сокета PHP-FPM
+ls -la /run/php/php8.1-fpm.sock
+```
+
+9. Настройка SSL (опционально)
+
+```bash
+# Установка Certbot для Let's Encrypt
+sudo apt install certbot python3-certbot-apache  # Ubuntu/Debian
+sudo yum install certbot python3-certbot-apache  # CentOS/RHEL
+
+# Получение сертификата
+sudo certbot --apache -d your-domain.com
+```
+
+После выполнения этих шагов ваш Nextcloud должен быть доступен через Apache с корректной обработкой PHP через PHP-FPM.

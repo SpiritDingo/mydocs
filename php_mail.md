@@ -21,8 +21,8 @@ $message = "Это тестовое сообщение.<br>Проверка ра
 // Заголовки
 $headers  = "MIME-Version: 1.0\r\n";
 $headers .= "Content-type: text/html; charset=" . $charset . "\r\n";
-$headers .= "From: noreply@stada.ru\r\n";
-$headers .= "Reply-To: noreply@stada.ru\r\n";
+$headers .= "From: noreply@mail.ru\r\n";
+$headers .= "Reply-To: noreply@mail.ru\r\n";
 $headers .= "X-Mailer: PHP/" . phpversion();
 
 // Дополнительные настройки для избежания спам-фильтров

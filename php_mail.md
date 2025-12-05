@@ -127,7 +127,7 @@ $subject = "test";
 $subject_encoded = '=?windows-1251?B?' . base64_encode($subject) . '?=';
 $message = "test";
 $headers  = "Content-type: text/html; charset=windows-1251\r\n";
-$headers .= "From: noreply@stada.ru\r\n";
+$headers .= "From: noreply@mail.ru\r\n";
 $test = mail($to, $subject_encoded, $message, $headers);
 var_dump($test);
 echo "end";

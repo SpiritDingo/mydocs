@@ -407,3 +407,325 @@ python telegram_downloader.py --monitor
 ```
 
 Скрипт автоматически обработает авторизацию и сохранит сессию для последующих запусков.
+
+
+
+
+
+Мы создадим контейнеризированное решение для скачивания файлов из Telegram каналов с использованием Docker Compose. Скрипт поддерживает как разовое скачивание, так и режим постоянного мониторинга новых сообщений.
+
+Структура проекта
+
+```
+telegram-downloader/
+├── Dockerfile
+├── docker-compose.yml
+├── requirements.txt
+├── config.env.example
+├── downloader.py
+└── README.md (опционально)
+```
+
+1. Python скрипт downloader.py
+
+```python
+#!/usr/bin/env python3
+import os
+import asyncio
+import argparse
+from datetime import datetime
+from telethon import TelegramClient, events
+from telethon.tl.types import MessageMediaDocument, MessageMediaPhoto
+import logging
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+class TelegramDownloader:
+    def __init__(self):
+        # Чтение переменных окружения
+        self.api_id = int(os.getenv('API_ID', 0))
+        self.api_hash = os.getenv('API_HASH', '')
+        self.phone = os.getenv('PHONE', '')
+        self.channels = [ch.strip() for ch in os.getenv('CHANNELS', '').split(',') if ch.strip()]
+        self.download_path = os.getenv('DOWNLOAD_PATH', '/downloads')
+        self.file_types = os.getenv('FILE_TYPES', 'all')  # all, photos, documents
+        self.limit = int(os.getenv('LIMIT', 0))
+        self.date_from = os.getenv('DATE_FROM', None)
+        self.session_file = os.getenv('SESSION_FILE', 'session/telegram.session')
+
+        if not self.api_id or not self.api_hash or not self.phone:
+            raise ValueError("API_ID, API_HASH и PHONE должны быть заданы в окружении")
+
+    def generate_filename(self, message):
+        """Генерирует имя файла на основе даты и ID сообщения"""
+        date_str = message.date.strftime('%Y%m%d_%H%M%S')
+        if hasattr(message.media, 'document'):
+            for attr in message.media.document.attributes:
+                if hasattr(attr, 'file_name') and attr.file_name:
+                    name, ext = os.path.splitext(attr.file_name)
+                    return f"{date_str}_{name}{ext}"
+            return f"document_{message.id}_{date_str}.bin"
+        elif isinstance(message.media, MessageMediaPhoto):
+            return f"photo_{message.id}_{date_str}.jpg"
+        return f"file_{message.id}_{date_str}.dat"
+
+    async def download_from_channel(self, client, channel_ref):
+        """Скачивает файлы из указанного канала"""
+        try:
+            entity = await client.get_entity(channel_ref)
+            channel_name = getattr(entity, 'username', None) or str(entity.id)
+            logger.info(f"Обработка канала: {channel_name}")
+
+            # Папка для канала
+            channel_path = os.path.join(self.download_path, channel_name)
+            os.makedirs(channel_path, exist_ok=True)
+
+            filters = {}
+            if self.limit > 0:
+                filters['limit'] = self.limit
+            if self.date_from:
+                filters['offset_date'] = datetime.fromisoformat(self.date_from)
+
+            messages = await client.get_messages(entity, **filters)
+            stats = {'downloaded': 0, 'skipped': 0, 'total': len(messages)}
+
+            for msg in messages:
+                if not msg.media:
+                    continue
+
+                # Фильтр по типу медиа
+                if self.file_types == 'photos' and not isinstance(msg.media, MessageMediaPhoto):
+                    stats['skipped'] += 1
+                    continue
+                if self.file_types == 'documents' and not isinstance(msg.media, MessageMediaDocument):
+                    stats['skipped'] += 1
+                    continue
+
+                filename = self.generate_filename(msg)
+                filepath = os.path.join(channel_path, filename)
+
+                if os.path.exists(filepath):
+                    logger.info(f"⏭ Пропуск (уже есть): {filename}")
+                    stats['skipped'] += 1
+                    continue
+
+                logger.info(f"⬇ Скачивание: {filename}")
+                await msg.download_media(file=filepath)
+                stats['downloaded'] += 1
+                logger.info(f"✓ Успешно: {filename}")
+
+            return stats
+
+        except Exception as e:
+            logger.error(f"Ошибка при обработке канала {channel_ref}: {e}")
+            return None
+
+    async def run_download(self):
+        """Разовое скачивание"""
+        async with TelegramClient(self.session_file, self.api_id, self.api_hash) as client:
+            await client.start(phone=self.phone)
+            logger.info("Клиент Telegram запущен")
+
+            total = {'downloaded': 0, 'skipped': 0, 'total': 0}
+            for channel in self.channels:
+                stats = await self.download_from_channel(client, channel)
+                if stats:
+                    total['downloaded'] += stats['downloaded']
+                    total['skipped'] += stats['skipped']
+                    total['total'] += stats['total']
+
+            logger.info(f"Итоги: скачано {total['downloaded']}, пропущено {total['skipped']}, всего {total['total']}")
+
+    async def run_monitor(self):
+        """Режим мониторинга новых сообщений"""
+        client = TelegramClient(self.session_file, self.api_id, self.api_hash)
+
+        @client.on(events.NewMessage(chats=self.channels))
+        async def handler(event):
+            if not event.message.media:
+                return
+
+            # Определяем канал
+            chat = await event.get_chat()
+            channel_name = getattr(chat, 'username', None) or str(chat.id)
+            channel_path = os.path.join(self.download_path, channel_name)
+            os.makedirs(channel_path, exist_ok=True)
+
+            filename = self.generate_filename(event.message)
+            filepath = os.path.join(channel_path, filename)
+
+            if os.path.exists(filepath):
+                logger.info(f"⏭ Пропуск (уже есть): {filename}")
+                return
+
+            logger.info(f"⬇ Новый файл в {channel_name}: {filename}")
+            await event.message.download_media(file=filepath)
+            logger.info(f"✓ Сохранено: {filename}")
+
+        await client.start(phone=self.phone)
+        logger.info("Мониторинг запущен. Ожидание новых сообщений...")
+        await client.run_until_disconnected()
+
+def main():
+    parser = argparse.ArgumentParser(description='Скачивание файлов из Telegram каналов')
+    parser.add_argument('--monitor', action='store_true', help='Запустить в режиме мониторинга')
+    args = parser.parse_args()
+
+    downloader = TelegramDownloader()
+    if args.monitor:
+        asyncio.run(downloader.run_monitor())
+    else:
+        asyncio.run(downloader.run_download())
+
+if __name__ == '__main__':
+    main()
+```
+
+2. Файл зависимостей requirements.txt
+
+```
+telethon>=1.34.0
+cryptg>=0.4.0
+```
+
+3. Dockerfile
+
+```dockerfile
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Копируем зависимости и устанавливаем их
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Копируем скрипт
+COPY downloader.py .
+
+# Создаем директории для сессии и загрузок
+RUN mkdir -p /app/session /downloads
+
+# Точка входа: запускаем скрипт с переданными аргументами
+ENTRYPOINT ["python", "/app/downloader.py"]
+```
+
+4. docker-compose.yml
+
+```yaml
+version: '3.8'
+
+services:
+  # Сервис для разового скачивания
+  download:
+    build: .
+    container_name: tg_downloader_once
+    env_file:
+      - config.env
+    volumes:
+      - ./downloads:/downloads
+      - ./session:/app/session
+    command: []  # без --monitor – разовое скачивание
+    profiles:
+      - once
+
+  # Сервис для постоянного мониторинга
+  monitor:
+    build: .
+    container_name: tg_downloader_monitor
+    restart: unless-stopped
+    env_file:
+      - config.env
+    volumes:
+      - ./downloads:/downloads
+      - ./session:/app/session
+    command: ["--monitor"]
+    profiles:
+      - monitor
+```
+
+5. Пример файла переменных окружения config.env.example
+
+```
+# Получить на https://my.telegram.org
+API_ID=123456
+API_HASH=your_api_hash_here
+PHONE=+71234567890
+
+# Каналы через запятую (можно username или ссылки)
+CHANNELS=@channel1,@channel2,https://t.me/channel3
+
+# Папка для загрузок (внутри контейнера)
+DOWNLOAD_PATH=/downloads
+
+# Типы файлов: all, photos, documents
+FILE_TYPES=all
+
+# Лимит сообщений (0 = без лимита)
+LIMIT=100
+
+# Начиная с даты (опционально, формат YYYY-MM-DD)
+DATE_FROM=2024-01-01
+
+# Файл сессии (путь внутри контейнера)
+SESSION_FILE=/app/session/telegram.session
+```
+
+Инструкция по запуску
+
+1. Подготовка
+
+Скопируйте файлы проекта в отдельную папку. Переименуйте config.env.example в config.env и отредактируйте его, указав свои данные (API_ID, API_HASH, PHONE, список каналов).
+
+2. Первый запуск для создания сессии
+
+При первом запуске Telegram запросит код подтверждения. Для этого нужно запустить контейнер в интерактивном режиме. Выполните:
+
+```bash
+docker-compose run --rm download
+```
+
+Введите запрошенный код. После успешной авторизации файл сессии сохранится в папку ./session на хосте (благодаря монтированию тома). Теперь сессия готова для дальнейшего использования.
+
+3. Разовое скачивание
+
+Чтобы скачать файлы из каналов один раз, используйте профиль once:
+
+```bash
+docker-compose --profile once up
+```
+
+Контейнер выполнит задачу и остановится.
+
+4. Постоянный мониторинг
+
+Для запуска в режиме мониторинга новых сообщений:
+
+```bash
+docker-compose --profile monitor up -d
+```
+
+Контейнер будет работать в фоне, автоматически перезапускаться при сбоях (restart: unless-stopped) и скачивать все новые файлы из указанных каналов.
+
+5. Остановка мониторинга
+
+```bash
+docker-compose --profile monitor down
+```
+
+6. Просмотр логов
+
+```bash
+docker-compose --profile monitor logs -f
+```
+
+Важные замечания
+
+· Безопасность: никогда не коммитьте config.env и папку session в Git – добавьте их в .gitignore.
+· Двухфакторная аутентификация: если у вас включена 2FA, при первом запуске потребуется ввести пароль. Скрипт поддерживает это.
+· Обновление списка каналов: после изменения CHANNELS в config.env перезапустите контейнер мониторинга.
+· Права доступа: убедитесь, что папки downloads и session доступны для записи контейнеру (обычно достаточно chmod 777 или запуска от текущего пользователя).
+
+Заключение
+
+Вы получили полностью контейнеризированное решение для скачивания файлов из Telegram каналов. Оно легко разворачивается, масштабируется и может работать в фоне, автоматически сохраняя новые медиафайлы.

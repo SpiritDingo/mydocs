@@ -6,7 +6,8 @@
 
 Как это сделать в 3 строчки:
 
-'''python
+```python
+
 import requests
 
 # 1. Делаем GET-запрос по адресу
@@ -21,7 +22,7 @@ if response.status_code == 200:
 else:
     print("Ошибка соединения 😢")
 
-'''
+```
 
 📌 Разбор:
 

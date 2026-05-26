@@ -249,3 +249,255 @@ _________
 Если нужно заблокировать скачивание **по ролям** (например, `dev` может тянуть из PyPI, но не из Docker), создайте `Privilege: nx-repository-view-docker-<name>-read` и назначьте её только нужной роли. Routing Rules работают глобально, Privileges – по пользователям/группам.
 
 Уточните, если нужна интеграция с CI/CD (GitLab/Jenkins) или настройка зеркал с фильтрацией по версиям.
+
+________________
+________________
+
+Ниже приведены **углублённые, production-ready примеры** настройки ограничений для `proxy` репозиториев в Nexus 3.x. Все примеры учитывают реальную структуру API каждого формата, особенности кэширования клиентов и поведение Java-Regex в Nexus.
+
+---
+## 📐 Базовые принципы работы Routing Rules в Nexus
+| Правило | Поведение |
+|---------|-----------|
+| **Path Regex** | Применяется к полному HTTP-пути: `/repository/<имя-proxy>/...` |
+| **Приоритет** | Если срабатывает **хотя бы одно `Deny`** → `403 Forbidden`. `Allow` игнорируется. |
+| **Кэш** | Правило не удаляет уже закэшированные артефакты. Требуется ручной/REST purge. |
+| **Формат Regex** | Используется Java `java.util.regex`. Экранируйте точки: `\.` |
+
+> 💡 **Совет:** В UI привязывайте правило к конкретному репозиторию. В regex пишите путь **без** префикса `/repository/<имя>/`, если правило уже привязано. Если не привязано → используйте полный путь.
+
+---
+## 🐳 Docker Proxy (Deep Dive)
+Docker Registry API v2 имеет чёткую структуру. Клиент сначала запрашивает манифест по тегу, получает `digest`, затем скачивает слои (blobs).
+
+### 🔹 Пример 1: Блокировка namespace/организации
+```regex
+^/v2/untrusted-org/.*
+```
+**Что блокирует:** `docker pull untrusted-org/app:latest`, `docker push`, запросы к каталогу.
+**Почему работает:** Все запросы к образам этой организации начинаются с `/v2/untrusted-org/`.
+
+### 🔹 Пример 2: Блокировка конкретных образов в любом namespace
+```regex
+^/v2/(library|mycompany)/malware-app(/.*)?$
+```
+**Что блокирует:** `docker pull malware-app`, `docker pull mycompany/malware-app:v1.2`
+
+### 🔹 Пример 3: Блокировка тегов `:latest`, `:nightly`, `:dev`
+```regex
+^/v2/.*/manifests/(latest|nightly|dev|latest.*)$
+```
+⚠️ **Важно:** Блокируется только запрос манифеста. Если blob уже в кэше, `docker pull` может завершиться частично. Для полной блокировки добавьте:
+```regex
+^/v2/.*/blobs/sha256:.*
+```
+*(Блокирует все слои → радикально, используйте только для изоляции)*
+
+### 🔹 Тестирование
+```bash
+# Должно вернуть 403
+curl -I https://nexus.company.com/repository/docker-proxy/v2/untrusted-org/app/manifests/latest
+
+# Docker клиент (покажет "denied: requested access to the resource is denied")
+docker pull nexus.company.com/docker-proxy/untrusted-org/app:latest
+```
+
+---
+## 🐍 PyPI Proxy (Deep Dive)
+`pip` использует два пути: `/simple/<project>/` (HTML-индекс) и `/packages/<hash>/<filename>` (файлы).
+
+### 🔹 Пример 1: Полное скрытие пакета от `pip`
+```regex
+^/simple/restricted-lib(/.*)?$
+```
+**Результат:** `pip search` и `pip install restricted-lib` → `ERROR: Could not find a version that satisfies the requirement`
+
+### 🔹 Пример 2: Блокировка конкретных версий (Java Regex)
+```regex
+^/packages/.*/restricted_lib-(1\.(0|1)\.\d+|2\.0\.[0-5])(-.*|)\.(whl|tar\.gz|zip)$
+```
+**Разбор:**
+- `1.0.x`, `1.1.x`, `2.0.0`..`2.0.5` → заблокированы
+- `2.0.6`, `2.1.0` → пропустятся
+
+### 🔹 Пример 3: Глобальный запрет pre-release
+```regex
+^/packages/.*/[^/]*[_.](a|b|c|rc|alpha|beta|dev)\d.*\.(whl|tar\.gz|zip)$
+```
+**Особенность:** Соответствует PEP 440. Блокирует `package-1.0a1`, `lib_2.0rc3`, `tool-dev1`.
+
+### 🔹 Тестирование
+```bash
+# pip (обязательно отключите кэш, иначе pip возьмёт локальную копию)
+PIP_NO_CACHE_DIR=1 pip install --index-url https://nexus.company.com/repository/pypi-proxy/simple/ restricted-lib
+```
+
+---
+## 📦 Debian (apt) Proxy (Deep Dive)
+Структура: `/dists/<suite>/` (метаданные), `/pool/<component>/` (пакеты). **Никогда не блокируйте `/dists/`!**
+
+### 🔹 Пример 1: Блокировка компонентов `non-free` и `contrib`
+```regex
+^/pool/(non-free|contrib)/.*
+```
+**Результат:** `apt update` проходит, но `apt install <non-free-pkg>` → `403 Forbidden`
+
+### 🔹 Пример 2: Блокировка пакета по имени (любые версии/архитектуры)
+```regex
+^/pool/.*/(unwanted-tool)-[0-9.]+.*\.deb$
+```
+**Примечание:** Дефис перед версией обязателен в Debian naming convention.
+
+### 🔹 Пример 3: Разрешить только `main` (Allow/Deny цепочка)
+1. Правило 1 (Allow): `^/pool/main/.*` → Action: `Allow`
+2. Правило 2 (Deny): `^/pool/.*` → Action: `Deny`
+**Логика Nexus:** Если сработало `Allow` и **нет** `Deny` → пропуск. Если сработал `Deny` → блок, даже если было `Allow`. Поэтому порядок важен: ставьте `Deny` ниже `Allow`.
+
+### 🔹 Тестирование
+```bash
+# После изменения правил обновите кэш
+apt-get update
+apt-get install unwanted-tool  # Ожидается 403 или "Unable to fetch"
+```
+
+---
+## 📦 RPM (Yum/DNF) Proxy (Deep Dive)
+Структура: `/repodata/` (метаданные), `/packages/<arch>/<pkg>.rpm`. **Не блокируйте `/repodata/`!**
+
+### 🔹 Пример 1: Блокировка debuginfo и src-пакетов
+```regex
+^/packages/.*/(debug|src)/.*\.rpm$
+```
+**Зачем:** Экономия дискового пространства на сервере и трафика у клиентов.
+
+### 🔹 Пример 2: Блокировка конкретного пакета
+```regex
+^/packages/.*/unwanted-svc-[0-9].*\.rpm$
+```
+**Нюанс:** Если пакет указан в зависимостях другого RPM, `yum install` упадёт с `Error: Package: unwanted-svc`. Это ожидаемое поведение.
+
+### 🔹 Пример 3: Разрешить только `x86_64`
+```regex
+^/packages/((?!x86_64).)*\.rpm$
+```
+**Как работает:** Negative lookahead запрещает любые пути, где **нет** `x86_64` перед `.rpm`.
+
+### 🔹 Тестирование
+```bash
+yum clean all
+yum makecache
+yum install unwanted-svc  # 403 Forbidden или "No package available"
+```
+
+---
+## 🔀 Продвинутые паттерны и комбинации
+
+### 🧩 1. IP + Path (Требует Nexus Pro)
+В Pro-версии можно создать правило:
+- **Condition Type:** `IP Address`
+- **Match:** `10.0.50.0/24`
+- **Action:** `Deny`
+- **Repositories:** `pypi-proxy`
+В OSS это делается через Nginx: `deny 10.0.50.0/24;` в location `/repository/pypi-proxy/`.
+
+### 🧩 2. HTTP Method Filtering (Pro)
+Разрешить `HEAD`/`GET` для проверки существования, но запретить скачивание:
+- **Condition Type:** `HTTP Method`
+- **Match:** `GET`
+- **Action:** `Deny`
+*(В OSS метод не фильтруется, только путь)*
+
+### 🧩 3. Комбинация с Content Selectors (для Hosted/Group)
+Routing Rules не работают с `hosted`. Для него:
+1. Content Selector: `path =~ "^/internal/.*" && format == "rpm"`
+2. Privilege: `nx-repository-view-rpm-internal-read` → привязать к селектору
+3. Назначить привилегию только роли `ci-pipeline`
+
+---
+## 🛠️ Отладка и управление кэшем
+
+### 🔍 Включить DEBUG логирование правил
+```bash
+# В UI: Administration → System → Logging → Add Logger
+Name: org.sonatype.nexus.repository.routing.internal
+Level: DEBUG
+```
+В `nexus.log` появится:
+```
+DEBUG [qtp123-456] org.sonatype.nexus.repository.routing.internal.RoutingRuleServiceImpl - 
+Routing rule evaluation: path='/repository/pypi-proxy/simple/restricted-lib/', 
+rules=[Rule{name='block-restricted', action=Deny, regex='^/simple/restricted-lib/.*'}]
+```
+
+### 🗑️ Очистка закэшированных заблокированных артефактов
+Routing Rules не удаляют кэш. Очистите вручную:
+```bash
+# 1. Поиск компонентов
+curl -u admin:admin123 -X GET "https://nexus/service/rest/v1/search?repository=docker-proxy&docker.imageName=untrusted-org/app"
+
+# 2. Удаление по ID
+curl -u admin:admin123 -X DELETE "https://nexus/service/rest/v1/search?repository=docker-proxy&docker.imageName=untrusted-org/app"
+
+# Или через UI: Browse → Repository → docker-proxy → найти → Delete
+```
+
+### 🔄 Автоматический purge (REST API)
+Для CI/CD удобно удалять кэш после добавления правила:
+```bash
+curl -u admin:admin123 -X POST \
+  "https://nexus/service/rest/v1/script" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "purge-blocked",
+    "type": "groovy",
+    "content": "repository.cleanup(repository.manager.get(\"docker-proxy\"), [\"docker.cleanup\"])"
+  }'
+```
+
+---
+## ⚠️ Почему правило может НЕ работать?
+
+| Симптом | Причина | Решение |
+|---------|---------|---------|
+| `200 OK` вместо `403` | Артефакт уже в кэше | Сделайте `DELETE` или `Purge unused` |
+| `pip/apt/yum` берёт старую версию | Кэш клиента | `pip install --no-cache-dir`, `apt-get clean`, `yum clean all` |
+| Правило игнорируется | Regex не совпадает с полным путём | Проверьте в логах точный `path=` |
+| `Allow` не срабатывает | Есть другое `Deny`, которое тоже совпало | Удалите или уточните regex conflicting rule |
+| Docker pull работает частично | Блокируется только `manifests`, но `blobs` уже в кэше | Добавьте правило на `/v2/.*/blobs/.*` или очистите кэш |
+
+---
+## 📡 Массовое управление правилами через REST API
+```json
+// POST /service/rest/v1/routing-rules
+{
+  "name": "block-untrusted-pypi",
+  "description": "Deny restricted packages",
+  "mode": "Deny",
+  "matchers": [
+    {
+      "type": "path",
+      "pattern": "^/repository/pypi-proxy/simple/(restricted-lib|malware-pkg)/.*"
+    }
+  ],
+  "repositories": ["pypi-proxy"]
+}
+```
+**GET/PUT/DELETE:** `/service/rest/v1/routing-rules/{ruleName}`
+
+---
+## ✅ Итоговая матрица применимости
+
+| Формат | Безопасно блокировать | Никогда не блокировать | Клиентский кэш |
+|--------|----------------------|------------------------|----------------|
+| **Docker** | `/v2/<org>/`, `/v2/.../manifests/<tag>` | `/v2/_catalog`, `/v2/token` | `docker image prune` |
+| **PyPI** | `/simple/<pkg>/`, `/packages/<ver>/` | `/pypi/`, `/simple/` (глобально) | `~/.cache/pip` |
+| **Debian** | `/pool/<comp>/`, `/pool/<pkg>` | `/dists/`, `/pool/` (глобально) | `/var/lib/apt/lists/` |
+| **RPM** | `/packages/<arch>/<pkg>`, `/packages/debug/` | `/repodata/`, `/packages/` (глобально) | `/var/cache/yum` |
+
+---
+Если вам нужно:
+- Настроить **зеркалирование с фильтрацией по semver** (например, разрешить только `>=2.0.0 <3.0.0`)
+- Интегрировать правила с **GitLab CI / Jenkins** (автогенерация правил из `.allowed-packages`)
+- Настроить **Nginx/Traefik** для rate-limiting + IP-geo блокировки перед Nexus
+
+Уточните задачу, и я подготовлю точный конфиг под ваш стек.

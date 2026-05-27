@@ -501,3 +501,188 @@ curl -u admin:admin123 -X POST \
 - Настроить **Nginx/Traefik** для rate-limiting + IP-geo блокировки перед Nexus
 
 Уточните задачу, и я подготовлю точный конфиг под ваш стек.
+
+______________
+______________
+______________
+
+Content Selectors в Nexus 3.x — это **метаданные-фильтры**, которые работают на уровне компонентов/артефактов, а не HTTP-запросов. В отличие от Routing Rules (которые блокируют на уровне прокси), Content Selectors используются для:
+- ✅ Тонкого контроля доступа через `Privileges`
+- 🗑️ Автоматической очистки кэша (`Cleanup Policies`)
+- 📊 Фильтрации в поиске, отчётах и интеграциях (IQ, CI/CD)
+
+Ниже приведены **production-ready примеры** синтаксиса, шаги применения и нюансы для каждого формата.
+
+---
+## 📖 Синтаксис и доступные атрибуты
+```text
+format == "<формат>" && 
+(attributes.<формат>.<поле> == "значение" || path =~ "regex") && 
+repositoryName == "<имя-репо>"
+```
+| Оператор | Пример |
+|----------|--------|
+| `==`, `!=` | Точное совпадение |
+| `=~`, `!~` | Регулярное выражение (Java regex) |
+| `in`, `not in` | Проверка в списке: `attributes.docker.tag in ("latest", "dev")` |
+| `&&`, `||`, `()` | Логические операторы |
+
+> 🔍 **Как узнать точные имена атрибутов?**  
+> В UI: `Browse → Repository → ваш репо → Search → Advanced`  
+> Или REST: `GET /service/rest/v1/assets?repository=<имя>&limit=1` → смотрите `attributes`.
+
+---
+## 🐳 Docker Proxy
+| Цель | Content Selector Expression |
+|------|-----------------------------|
+| Блокировать namespace/организацию | `format == "docker" && attributes.docker.imageName =~ "^untrusted-org/.*"` |
+| Запретить теги `latest`, `nightly`, `dev` | `format == "docker" && attributes.docker.tag in ("latest", "nightly", "dev")` |
+| Блокировать образы > 1GB | `format == "docker" && contentSize > 1073741824` |
+| Разрешить только определённые реестры | `format == "docker" && attributes.docker.imageName =~ "^(library|mycompany)/.*"` |
+
+---
+## 🐍 PyPI Proxy
+| Цель | Content Selector Expression |
+|------|-----------------------------|
+| Скрыть конкретный пакет | `format == "pypi" && attributes.pypi.name == "restricted-lib"` |
+| Блокировать pre-release версии | `format == "pypi" && attributes.pypi.version =~ ".*(a|b|rc|alpha|beta|dev)\d+"` |
+| Запретить только `.tar.gz` (разрешить `.whl`) | `format == "pypi" && path =~ ".*\\.tar\\.gz$"` |
+| Фильтр по версии (semver) | `format == "pypi" && attributes.pypi.version =~ "^[0-1]\\."` |
+
+---
+## 📦 Debian (apt) Proxy
+| Цель | Content Selector Expression |
+|------|-----------------------------|
+| Блокировать компонент `non-free` | `format == "apt" && attributes.deb.component == "non-free"` |
+| Запретить архитектуру `i386` | `format == "apt" && attributes.deb.architecture == "i386"` |
+| Блокировать пакет по имени (все версии) | `format == "apt" && attributes.deb.package == "unwanted-tool"` |
+| Разрешить только `main` и `amd64` | `format == "apt" && attributes.deb.component == "main" && attributes.deb.architecture == "amd64"` |
+
+---
+## 📦 RPM (Yum/DNF) Proxy
+| Цель | Content Selector Expression |
+|------|-----------------------------|
+| Блокировать `debuginfo` и `src` | `format == "yum" && attributes.rpm.architecture in ("debug", "src")` |
+| Запретить пакет по имени | `format == "yum" && attributes.rpm.name == "unwanted-svc"` |
+| Фильтр по версии (например, только 2.x) | `format == "yum" && attributes.rpm.version =~ "^2\\."` |
+| Блокировать пакеты из определённой группы | `format == "yum" && attributes.rpm.group =~ "^Unwanted.*"` |
+
+---
+## 🔐 Как применить для ограничения скачивания (Access Control)
+В Nexus OSS привилегии работают по принципу **`GRANT-ONLY`**: что не разрешено явно → запрещено.
+
+### Шаг 1: Создайте Content Selector
+`Security → Content Selectors → Create`
+- **Name:** `docker-block-untrusted`
+- **Expression:** `format == "docker" && attributes.docker.imageName =~ "^untrusted-org/.*"`
+
+### Шаг 2: Создайте Privilege
+`Security → Privileges → Create → Content Selector Privilege`
+- **Name:** `docker-allowed-images`
+- **Repository:** `docker-proxy`
+- **Content Selector:** `docker-allow-trusted` *(создайте селектор с `!~ "^untrusted-org/.*"`)*
+- **Actions:** `read`, `browse`
+
+### Шаг 3: Назначьте через Role
+`Security → Roles → Create`
+- **Name:** `docker-devs`
+- **Privileges:** добавьте `docker-allowed-images`
+- **Assign:** добавьте пользователей/группы
+
+✅ **Результат:** Пользователи с ролью `docker-devs` смогут скачивать только разрешённые образы. Остальные получат `403` при `docker pull` или `curl`.
+
+> ⚠️ **Nexus OSS не поддерживает явный `Deny` в привилегиях.** Если нужно заблокировать конкретную группу для всех, кроме админов, создайте роль `docker-restricted` с привилегией на **разрешённый** селектор, а глобальную роль `*` не назначайте.
+
+---
+## 🗑️ Как применить для автоматической очистки (Cleanup Policy)
+Content Selectors + Cleanup Policies = автоматическое удаление ненужных артефактов.
+
+1. `Configuration → Repository → Cleanup Policies → Create`
+   - **Name:** `remove-old-docker-tags`
+   - **Selector:** `format == "docker" && attributes.docker.tag =~ "^(dev|test|build-\d+)$"`
+   - **Last downloaded older than:** `30 days`
+   - **Release types:** `Snapshot`, `Pre-release`
+2. `Configuration → Repository → docker-proxy → Cleanup`
+   - Добавьте политику `remove-old-docker-tags`
+3. Nexus запустит очистку по расписанию (по умолчанию каждые 24ч)
+
+---
+## 🔍 Тестирование и отладка
+
+### 1. Проверка через UI
+`Browse → Repository → ваш репо → Search → Advanced`  
+Вставьте expression → нажмите `Search`. Покажет все совпадающие компоненты.
+
+### 2. Проверка через REST API
+```bash
+curl -u admin:admin123 -G \
+  "https://nexus.company.com/service/rest/v1/search" \
+  --data-urlencode "repository=docker-proxy" \
+  --data-urlencode "q=format == \"docker\" && attributes.docker.imageName =~ \"^untrusted.*\""
+```
+
+### 3. Проверка прав доступа
+```bash
+# Должно вернуть 200 для разрешённого
+curl -I -u dev:pass https://nexus/repository/docker-proxy/v2/library/nginx/manifests/latest
+
+# Должно вернуть 403 для заблокированного
+curl -I -u dev:pass https://nexus/repository/docker-proxy/v2/untrusted-org/app/manifests/latest
+```
+
+### 4. Логирование оценки селекторов
+```xml
+<!-- logback-nexus.xml -->
+<logger name="org.sonatype.nexus.security.internal.selector" level="DEBUG"/>
+```
+В `nexus.log`:
+```
+DEBUG [qtp...] org.sonatype.nexus.security.internal.selector.ContentSelectorServiceImpl - 
+Evaluating selector 'docker-block-untrusted' for asset '/v2/untrusted-org/app/manifests/latest' → DENY
+```
+
+---
+## ⚖️ Content Selectors vs Routing Rules: что выбрать?
+
+| Критерий | Routing Rules | Content Selectors |
+|----------|---------------|-------------------|
+| **Уровень работы** | HTTP-запрос (до кэширования) | Метаданные компонента (после индексации) |
+| **Производительность** | Мгновенно, без нагрузки на БД | Зависит от индекса, может быть медленнее на больших репо |
+| **Гибкость** | Только `path`, `IP`, `HTTP Method` | Все атрибуты: версия, размер, тег, архитектура, custom metadata |
+| **Применение** | Блокировка, зеркалирование, IP-фильтры | Privileges, Cleanup, Search, Reporting |
+| **Кэш** | Не влияет на уже закэшированные артефакты | Не влияет, но можно связать с очисткой |
+| **Рекомендация** | Для быстрого HTTP-блокирования и rate-limit (вместе с Nginx) | Для тонкого контроля доступа по версиям/тегам/атрибутам |
+
+💡 **Лучшая практика:** Используйте **Routing Rules** для грубой фильтрации (IP, namespace, запрещённые пути), а **Content Selectors + Privileges** для точного контроля по версиям, архитектурам, тегам и автоматической очистки.
+
+---
+## 📦 Готовый шаблон для CI/CD (автоматизация через REST)
+```json
+// POST /service/rest/v1/content-selectors
+{
+  "name": "pypi-no-prelease",
+  "description": "Block alpha/beta/rc packages",
+  "expression": "format == \"pypi\" && attributes.pypi.version =~ \".*(a|b|rc|alpha|beta)\\d+.*\""
+}
+
+// POST /service/rest/v1/security/privileges
+{
+  "name": "pypi-stable-only",
+  "description": "Grant read access to stable PyPI packages",
+  "type": "selector",
+  "properties": {
+    "repository": "pypi-proxy",
+    "selector": "pypi-no-prelease",
+    "actions": ["read", "browse"]
+  }
+}
+```
+
+---
+Если нужно:
+- Сгенерировать селекторы под **ваши конкретные пакеты/версии**
+- Настроить **автоматическое удаление** кэша по расписанию
+- Интегрировать с **GitLab CI / Jenkins** для динамического управления правами
+- Настроить **Nginx + Content Selectors** для гибридной защиты
+
+Напишите ваш стек и требования, и я подготовлю точный конфиг под вашу инфраструктуру.

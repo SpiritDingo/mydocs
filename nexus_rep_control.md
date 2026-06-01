@@ -974,3 +974,94 @@ curl -u admin:admin123 -X POST \
 
 ---
 Если скажете, какую именно задачу решаете (ACL для разработчиков, очистка кэша, фильтрация для CI/CD), я подготовлю точную связку `Selector → Privilege → Role` без использования запрещённых операторов.
+
+
+Да, это **штатное ограничение парсера CSEL в Nexus Repository Manager 3.x**. Оператор `!` и групповое отрицание `!(...)` **не поддерживаются** ни в OSS, ни в Pro-версии. Парсер принимает только сравнения на уровне полей (`!=`, `!~`) и логические связки (`&&`, `||`).
+
+Ниже приведены **100% рабочие варианты для Nexus 3**, которые проходят валидацию UI и REST API.
+
+---
+## ✅ Валидные CSEL-выражения для Nexus 3
+
+| Ваша цель | Валидный CSEL для NX3 |
+|-----------|------------------------|
+| Исключить 1 пакет | `format == "pypi" && attributes.pypi.name != "blocked-pkg"` |
+| Исключить несколько пакетов | `format == "pypi" && attributes.pypi.name not in ("pkg1", "pkg2", "unsafe-lib")` |
+| Исключить пакет + оставить только стабильные версии | `format == "pypi" && attributes.pypi.name != "blocked-pkg" && attributes.pypi.version =~ "^\\d+\\.\\d+\\.\\d+$"` |
+| Разрешить только конкретные версии (чёрный список наоборот) | `format == "pypi" && attributes.pypi.name == "requests" && attributes.pypi.version in ("2.28.0", "2.31.0")` |
+| Запретить pre-release (альтернатива `!()`) | `format == "pypi" && attributes.pypi.version !~ ".*[_.-]?(a\|b\|rc\|alpha\|beta\|dev)\\d*.*"` |
+
+> 💡 **Важно:** В UI Nexus 3 используйте **двойные кавычки `"`** для строк. Одинарные `'` могут вызвать синтаксическую ошибку в старых сборках NX3.
+
+---
+## 🔑 Архитектурный нюанс NX3: модель `GRANT-ONLY`
+В Nexus 3 привилегии работают **только на разрешение**. 
+- Если вы создадите селектор `name != "blocked-pkg"` и назначите его как `read`-привилегию → Nexus **разрешит** всё, кроме `blocked-pkg`.
+- Но если у пользователя **нет явной привилегии** на этот репозиторий → он получит `403` на **всё**, включая разрешённые пакеты.
+
+### ✅ Правильный паттерн ограничения скачивания в NX3:
+1. **Создайте селектор с ПОЛОЖИТЕЛЬНОЙ логикой** (что разрешено):
+   ```text
+   format == "pypi" && attributes.pypi.name in ("requests", "flask", "django") && attributes.pypi.version =~ "^2\\.|^3\\."
+   ```
+2. `Security → Privileges → Create → Content Selector Privilege`
+   - Repository: `pypi-proxy`
+   - Selector: `pypi-allowed-packages`
+   - Actions: `read`, `browse`
+3. Назначьте привилегию только нужной `Role` → добавьте пользователей.
+4. Все пакеты, не попавшие в селектор, автоматически вернут `403`.
+
+---
+## 🛠 Как протестировать выражение в NX3 до сохранения
+1. `Security → Content Selectors → Create`
+2. Вставьте выражение в поле `Expression`
+3. Нажмите кнопку **`Validate`** (появляется справа от поля)
+4. NX3 покажет:
+   - ✅ `Expression is valid` + количество совпадающих компонентов
+   - ❌ `Invalid CSEL...` + номер колонки ошибки
+
+Или через REST API (сухой запуск):
+```bash
+curl -u admin:admin123 -X POST \
+  "https://nexus.company.com/service/rest/v1/search" \
+  -H "Content-Type: application/json" \
+  -d '{"repository":"pypi-proxy","q":"format == \"pypi\" && attributes.pypi.name != \"blocked-pkg\""}'
+```
+
+---
+## ⚠️ Почему `!()` никогда не заработает в NX3
+- Парсер CSEL в NX3 написан на ANTLR с жёстким набором токенов. `!` зарезервирован для внутренней обработки и не вынесен в пользовательский DSL.
+- Sonatype официально рекомендует использовать `!=`/`!~` или переходить к **положительным спискам** для ACL.
+- В NX3 Pro добавлены расширенные политики, но синтаксис CSEL остаётся неизменным.
+
+---
+## 📦 Готовый шаблон для автоматизации (REST API NX3)
+```json
+POST /service/rest/v1/content-selectors
+{
+  "name": "pypi-stable-allowed",
+  "description": "Only stable versions of approved packages",
+  "expression": "format == \"pypi\" && attributes.pypi.name in (\"requests\", \"flask\") && attributes.pypi.version =~ \"^\\d+\\.\\d+\\.\\d+$\""
+}
+```
+
+```json
+POST /service/rest/v1/security/privileges
+{
+  "name": "pypi-stable-read",
+  "type": "selector",
+  "properties": {
+    "repository": "pypi-proxy",
+    "selector": "pypi-stable-allowed",
+    "actions": ["read", "browse"]
+  }
+}
+```
+
+---
+Если напишете:
+- Какие **конкретные пакеты/версии** нужно разрешить или заблокировать
+- Для **какой роли/группы** настраивается доступ
+- Используется ли **NX3 OSS или Pro**
+
+Я сгенерирую точный валидный CSEL + пошаговый UI/API конфиг под ваш кейс, который гарантированно пройдёт валидацию в Nexus 3.

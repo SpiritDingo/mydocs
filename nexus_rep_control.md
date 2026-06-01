@@ -686,3 +686,198 @@ Evaluating selector 'docker-block-untrusted' for asset '/v2/untrusted-org/app/ma
 - Настроить **Nginx + Content Selectors** для гибридной защиты
 
 Напишите ваш стек и требования, и я подготовлю точный конфиг под вашу инфраструктуру.
+
+
+
+_____________
+
+
+Ниже приведены **production-ready примеры** настройки Content Selectors для PyPI proxy с фильтрацией по версиям. Все примеры учитывают специфику хранения метаданных в Nexus 3.x, синтаксис Java Regex и поведение `pip` клиентов.
+
+---
+## 📐 Базовый синтаксис селектора для PyPI
+```text
+format == "pypi" && attributes.pypi.name == "<имя_пакета>" && attributes.pypi.version =~ "<regex>"
+```
+| Атрибут | Описание |
+|---------|----------|
+| `format == "pypi"` | Обязательный префикс для всех PyPI-селекторов |
+| `attributes.pypi.name` | Каноническое имя пакета (например `requests`, `Django`) |
+| `attributes.pypi.version` | Строка версии из `METADATA`/`PKG-INFO` (например `2.28.1`, `1.0.0a3`, `2023.1.15`) |
+| `path` | Путь к файлу дистрибутива (`.whl`, `.tar.gz`) |
+| `repositoryName` | Имя прокси-репозитория (опционально) |
+
+> 🔍 **Как проверить точные атрибуты?**  
+> `GET /service/rest/v1/assets?repository=pypi-proxy&q=name=requests` → смотрите `attributes.pypi.*`
+
+---
+## 🎯 Готовые примеры фильтрации по версии
+
+### 1️⃣ Блокировка всех pre-release версий (`a`, `b`, `rc`, `dev`, `post`)
+```text
+format == "pypi" && attributes.pypi.version =~ ".*[_.-]?(a|b|c|rc|alpha|beta|dev|post)\d*.*"
+```
+**Что делает:** Скрывает `1.0.0a1`, `2.1.0rc2`, `3.0.dev0`, `1.5.post1`  
+**Применение:** Стабильные CI-пайплайны, production-окружения
+
+### 2️⃣ Разрешить только мажорную версию `2.x.x`
+```text
+format == "pypi" && attributes.pypi.name == "requests" && attributes.pypi.version =~ "^2\\."
+```
+**Что делает:** Пропускает `2.28.0`, `2.31.0`, блокирует `1.2.3`, `3.0.0`
+
+### 3️⃣ Явный чёрный список конкретных версий
+```text
+format == "pypi" && attributes.pypi.name in ("urllib3", "cryptography") && 
+attributes.pypi.version in ("1.26.15", "1.26.16", "37.0.0", "37.0.1")
+```
+**Что делает:** Блокирует уязвимые/проблемные версии. Удобно для быстрого реагирования на CVE.
+
+### 4️⃣ Диапазон `>=1.5.0` и `<1.10.0` (через Regex)
+⚠️ *Регулярные выражения не умеют в числовые сравнения. Для диапазонов используйте паттерны:*
+```text
+format == "pypi" && attributes.pypi.version =~ "^1\\.([5-9])\\..*" || attributes.pypi.version =~ "^1\\.([0-9]{2,})\\..*"
+```
+**Что делает:** Пропускает `1.5.x`..`1.9.x` и `1.10.x`+, блокирует `1.0.x`..`1.4.x`
+
+### 5️⃣ Только `.whl`, только стабильные версии `2.x`
+```text
+format == "pypi" && attributes.pypi.version =~ "^2\\." && path =~ ".*\\.whl$"
+```
+**Что делает:** Игнорирует `.tar.gz`, блокирует pre-release `2.x`
+
+### 6️⃣ Глобальный селектор "Разрешить всё, кроме явного"
+*(Для подхода GRANT-ONLY в привилегиях)*
+```text
+format == "pypi" && !(attributes.pypi.name == "blocked-pkg" && attributes.pypi.version =~ ".*")
+```
+**Что делает:** Разрешает все пакеты, кроме `blocked-pkg` любой версии
+
+---
+## 🔐 Как применить для ограничения скачивания (Access Control)
+
+Nexus OSS работает по принципу **`explicit GRANT`**. Что не разрешено → `403`.
+
+### Шаг 1: Создайте селектор
+`Security → Content Selectors → Create`
+- **Name:** `pypi-stable-requests`
+- **Expression:** `format == "pypi" && attributes.pypi.name == "requests" && attributes.pypi.version =~ "^2\\."`
+
+### Шаг 2: Создайте привилегию
+`Security → Privileges → Create → Content Selector Privilege`
+- **Name:** `pypi-read-stable`
+- **Repository:** `pypi-proxy`
+- **Content Selector:** `pypi-stable-requests`
+- **Actions:** `read`, `browse`
+
+### Шаг 3: Назначьте роль
+`Security → Roles → Create`
+- **Name:** `pip-devs`
+- **Privileges:** `pypi-read-stable`
+- **Members:** `jenkins-ci`, `@dev-team`
+
+✅ **Результат:** При запросе `pip install requests --index-url https://nexus/...` Nexus динамически отфильтрует `/simple/requests/` HTML-индекс. Пользователи без роли увидят только версии `2.x.x`. Остальные вернут `403` или `No matching distribution found`.
+
+---
+## 🗑️ Автоматическая очистка кэша (Cleanup Policy)
+```text
+format == "pypi" && attributes.pypi.version =~ ".*[_.-]?(a|b|rc|dev)\d*.*" && lastDownloaded < 30d
+```
+1. `Configuration → Repository → Cleanup Policies → Create`
+2. Привяжите селектор к `pypi-proxy`
+3. Nexus удалит pre-release версии, которые не скачивались 30+ дней
+
+---
+## 🔍 Тестирование и отладка
+
+### 1. Проверка в UI
+`Browse → pypi-proxy → Search → Advanced`  
+Вставьте expression → нажмите `Search`. Покажет компоненты, которые **соответствуют** селектору.
+
+### 2. REST API проверка
+```bash
+curl -u admin:admin123 -G \
+  "https://nexus/service/rest/v1/search" \
+  --data-urlencode "repository=pypi-proxy" \
+  --data-urlencode "q=format == \"pypi\" && attributes.pypi.name == \"requests\" && attributes.pypi.version =~ \"^2\\.\""
+```
+
+### 3. Тест через `pip`
+```bash
+# Обязательно отключите кэш клиента!
+PIP_NO_CACHE_DIR=1 pip install \
+  --index-url https://nexus.company.com/repository/pypi-proxy/simple/ \
+  --trusted-host nexus.company.com \
+  "requests>=2.0,<3.0"
+```
+**Ожидается:** Успешная установка только `2.x.x`. Версии `1.x` или `3.x` не попадут в индекс.
+
+### 4. Логи оценки прав
+```xml
+<!-- logback-nexus.xml -->
+<logger name="org.sonatype.nexus.security.internal.selector" level="DEBUG"/>
+```
+В `nexus.log`:
+```
+DEBUG [qtp...] ContentSelectorServiceImpl - Evaluating selector 'pypi-stable-requests' for asset 'requests-2.28.1-py3-none-any.whl' → ALLOW
+DEBUG [qtp...] ContentSelectorServiceImpl - Evaluating selector 'pypi-stable-requests' for asset 'requests-1.26.0.tar.gz' → DENY
+```
+
+---
+## ⚠️ Критические нюансы PyPI + Nexus
+
+| Проблема | Причина | Решение |
+|----------|---------|---------|
+| `pip` скачивает заблокированную версию | Локальный кэш `~/.cache/pip` | `pip install --no-cache-dir` или `rm -rf ~/.cache/pip` |
+| `/simple/<pkg>/` показывает все версии | Пользователь имеет роль `*` или `nx-repository-view-*` | Уберите глобальные права, оставьте только Content Selector Privilege |
+| Regex не срабатывает на `1.0.0.post1` | PyPI использует разные разделители (`-`, `_`, `.`) | Используйте `.*[_.-]?post\d*.*` вместо строгого `\\.post` |
+| Селектор не видит новые версии сразу | Nexus индексирует при первом запросе или по расписанию | Выполните `curl` к `/simple/<pkg>/` или запустите `Repository → Rebuild metadata` |
+| Фильтрация ломает `pip-compile`/`poetry` | Инструменты запрашивают `/simple/` и ожидают полный список | Создайте отдельный `group` с unrestricted proxy для build-скриптов |
+
+---
+## 📦 REST API шаблоны (автоматизация)
+
+### Создание селектора
+```json
+POST /service/rest/v1/content-selectors
+{
+  "name": "pypi-no-prelease-requests",
+  "description": "Block alpha/beta/rc for requests",
+  "expression": "format == \"pypi\" && attributes.pypi.name == \"requests\" && attributes.pypi.version =~ \".*[_.-]?(a|b|rc|alpha|beta|dev)\\d*.*\""
+}
+```
+
+### Создание привилегии
+```json
+POST /service/rest/v1/security/privileges
+{
+  "name": "pypi-requests-stable-read",
+  "type": "selector",
+  "properties": {
+    "repository": "pypi-proxy",
+    "selector": "pypi-no-prelease-requests",
+    "actions": ["read", "browse"]
+  }
+}
+```
+
+---
+## ✅ Итоговая матрица применимости
+
+| Задача | Механизм | Пример |
+|--------|----------|--------|
+| Скрыть pre-release | Content Selector + Privilege | `version =~ ".*[_.-]?(a\|b\|rc)\d*.*"` |
+| Разрешить только `2.x` | Content Selector + Privilege | `version =~ "^2\\."` |
+| Заблокировать CVE-версии | Content Selector (Deny через отсутствие Grant) | `version in ("1.26.15", "37.0.0")` |
+| Удалить старые кэши | Cleanup Policy + Selector | `version =~ "^1\\." && lastDownloaded < 60d` |
+| Rate limit / IP block | Nginx / Nexus Pro | Вне Nexus OSS |
+
+---
+💡 **Рекомендация:** Для сложных семантических диапазонов (`>=1.5,<2.0`) используйте **CI/CD генерацию списков разрешённых версий** + `version in (...)`, так как Java Regex не поддерживает числовую логику. Content Selectors идеальны для префиксов, суффиксов и явных списков.
+
+Если нужно:
+- Сгенерировать селекторы под ваш `requirements.txt`
+- Настроить автоматическое обновление селекторов при выходе новых CVE
+- Интегрировать с `poetry`/`pipenv`/`pdm` без поломки резолвера
+
+Напишите ваш формат управления зависимостями, и я подготовлю точный конфиг.

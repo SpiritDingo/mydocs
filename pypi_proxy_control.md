@@ -204,3 +204,139 @@ pip install --index-url http://localhost:8081/repository/pypi-group/simple/ <pac
 Прокси-сервер Nexus Routing Rules (регулярки по URL, перехватывают запросы к /packages/...)
 
 Рекомендуется сначала максимально ограничить зеркало через Bandersnatch, затем оперативно добирать/блокировать пакеты в Devpi, а Nexus использовать как центральную точку входа и финальный фильтр.
+
+
+_________
+
+
+
+Чтобы максимально ограничить зеркало Bandersnatch и при этом оперативно добирать или блокировать пакеты через Devpi, постройте такую архитектуру:
+
+· Bandersnatch зеркалирует только строго необходимые пакеты (белый список).
+· Devpi создаёт два индекса:
+  · root/bandersnatch-mirror – проксирует ваше урезанное зеркало Bandersnatch.
+  · root/prod – базируется на root/bandersnatch-mirror и стандартном root/pypi, чтобы недостающие пакеты автоматически «добирались» из PyPI. Здесь же применяются блокировки.
+· Nexus (опционально) служит единой точкой входа для pip.
+
+Ниже – конкретная настройка и команды.
+
+---
+
+1. Bandersnatch – белый список и минимум мусора
+
+В bandersnatch.conf задаём только нужные проекты и исключаем dev‑версии:
+
+```ini
+[mirror]
+directory = /srv/pypi
+master = https://pypi.org
+workers = 3
+stop-on-error = false
+delete-packages = true
+
+[plugins]
+enabled = blocklist_project
+
+[filter_packages]
+blacklist_regex = ^.*-(dev|rc|alpha|beta)[0-9]*$
+whitelist_project =
+    numpy
+    pandas
+    scipy
+    requests
+    flask
+    # добавьте сюда минимально необходимые пакеты
+```
+
+После изменения списка выполните:
+
+```bash
+docker-compose exec bandersnatch bash -c 'source /venv/bin/activate && bandersnatch mirror'
+```
+
+---
+
+2. Devpi – два индекса для «добирания» и блокировок
+
+Файл devpi-init.sh (подкладывается в /docker-entrypoint-init.d/init.sh) настраивает сервер:
+
+```bash
+#!/bin/bash
+sleep 5
+
+# Устанавливаем соединение и пароль root
+devpi use http://localhost:3141
+devpi login root --password ''
+devpi user -m root password="${DEVPISERVER_ROOT_PASSWORD:-admin123}"
+devpi login root --password="${DEVPISERVER_ROOT_PASSWORD:-admin123}"
+
+# 1. Индекс-прокси на локальное зеркало Bandersnatch
+devpi index -c bandersnatch-mirror type=mirror mirror_url="http://bandersnatch-nginx:80/simple/"
+# (type=mirror и mirror_url требуют Devpi >= 5.0)
+
+# 2. Стандартный PyPI-индекс (если ещё не создан)
+devpi index -c pypi bases= type=mirror mirror_url="https://pypi.org/simple/"
+
+# 3. Рабочий индекс, который сначала смотрит в урезанное зеркало, потом в PyPI
+devpi index -c prod bases=root/bandersnatch-mirror,root/pypi volatile=False
+
+# Оперативные блокировки (примеры)
+devpi index root/prod block oldpackage
+devpi index root/prod "block*" "test-*"
+```
+
+Что происходит:
+
+· root/bandersnatch-mirror – запросы к нему уходят в nginx с вашим зеркалом и кешируются.
+· root/prod при запросе пакета проверяет:
+  · собственный кеш;
+  · root/bandersnatch-mirror (т.е. локальное зеркало);
+  · root/pypi (напрямую в PyPI).
+    Так любой отсутствующий в зеркале пакет автоматически добирается из интернета.
+
+---
+
+3. Оперативная работа со списками
+
+Добавить пакет в белый список Bandersnatch (долгосрочно)
+
+1. Прописать его в whitelist_project в bandersnatch.conf.
+2. Запустить синхронизацию:
+   ```bash
+   docker-compose exec bandersnatch bash -c 'source /venv/bin/activate && bandersnatch mirror'
+   ```
+
+Разрешить пакет «на лету» (без правки зеркала)
+
+Просто установите его через Devpi – он автоматически «доберётся» из PyPI и закешируется в root/prod. Никаких дополнительных действий.
+
+Заблокировать пакет в Devpi (мгновенно)
+
+```bash
+docker-compose exec devpi devpi index root/prod block some-package
+```
+
+Пакет станет недоступен для всех, кто использует root/prod, даже если он есть в зеркале или в PyPI.
+
+Разблокировать
+
+```bash
+docker-compose exec devpi devpi index root/prod allow some-package
+```
+
+---
+
+4. Итоговая схема в docker-compose
+
+Приложенный ранее docker-compose.yml полностью подходит, нужно лишь заменить devpi-init.sh и bandersnatch.conf на новые версии. Nexus настраивается вручную на проксирование http://devpi:3141/root/prod/+simple/.
+
+---
+
+5. Почему это «максимальное ограничение + оперативность»
+
+· Зеркало Bandersnatch хранит только жёстко заданный белый список – минимум дискового пространства и трафика.
+· Devpi даёт возможность получать любые недостающие пакеты из PyPI без ручного вмешательства.
+· Блокировки в Devpi применяются мгновенно и не требуют перестройки зеркала.
+· При добавлении новых «разрешённых» пакетов в белый список Bandersnatch они становятся доступны локально без интернета после очередной синхронизации.
+
+Таким образом, вы совмещаете жёсткий контроль (Bandersnatch) с гибкостью и скоростью управления (Devpi).

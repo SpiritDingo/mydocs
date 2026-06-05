@@ -340,3 +340,134 @@ docker-compose exec devpi devpi index root/prod allow some-package
 · При добавлении новых «разрешённых» пакетов в белый список Bandersnatch они становятся доступны локально без интернета после очередной синхронизации.
 
 Таким образом, вы совмещаете жёсткий контроль (Bandersnatch) с гибкостью и скоростью управления (Devpi).
+
+
+_______
+
+
+
+Devpi-constrained — это плагин для Devpi, который позволяет задавать для индекса ограничения на версии пакетов (constraints). В отличие от простого block/allow (блокирует пакет целиком), constrained позволяет тонко регулировать допустимые версии, например:
+numpy>=1.21,<2.0 – разрешены только определённые диапазоны.
+
+В описанной ранее архитектуре это даёт третий уровень контроля:
+
+· Bandersnatch фильтрует имена пакетов (белый список);
+· Devpi constrained ограничивает версии внутри разрешённых пакетов;
+· Devpi block/allow при необходимости полностью скрывает пакет.
+
+---
+
+1. Добавляем devpi-constrained в Docker-образ
+
+Создайте рядом с docker-compose.yml файл Dockerfile.devpi:
+
+```dockerfile
+FROM devpi/devpi:latest
+
+# Установка плагина constrained
+RUN pip install devpi-constrained
+```
+
+В docker-compose.yml замените образ devpi на сборку:
+
+```yaml
+devpi:
+  build:
+    context: .
+    dockerfile: Dockerfile.devpi
+  container_name: devpi
+  restart: unless-stopped
+  ports:
+    - "3141:3141"
+  volumes:
+    - devpi-data:/data
+    - ./devpi-init.sh:/docker-entrypoint-init.d/init.sh:ro
+  environment:
+    - DEVPISERVER_HOST=0.0.0.0
+    - DEVPISERVER_ROOT_PASSWORD=admin123
+  networks:
+    - pypi-net
+```
+
+---
+
+2. Настройка constrained-индекса при старте
+
+Модифицируйте devpi-init.sh, добавив создание индекса с ограничениями:
+
+```bash
+#!/bin/bash
+sleep 5
+
+devpi use http://localhost:3141
+devpi login root --password ''
+devpi user -m root password="${DEVPISERVER_ROOT_PASSWORD:-admin123}"
+devpi login root --password="${DEVPISERVER_ROOT_PASSWORD:-admin123}"
+
+# Зеркало на Bandersnatch
+devpi index -c bandersnatch-mirror type=mirror mirror_url="http://bandersnatch-nginx:80/simple/"
+
+# Обычный PyPI
+devpi index -c pypi type=mirror mirror_url="https://pypi.org/simple/"
+
+# Рабочий индекс с базовыми источниками
+devpi index -c prod bases=root/bandersnatch-mirror,root/pypi volatile=False
+
+# Применяем constrained-ограничения
+# Правила задаются в виде строки: "package1>=1.0,<2.0; package2==3.2.1"
+devpi index root/prod constraints="numpy>=1.21,<2.0; pandas>=1.3,<2.0; requests>=2.25"
+
+# Дополнительно можно оставить оперативные блокировки
+devpi index root/prod block oldpackage
+devpi index root/prod "block*" "test-*"
+```
+
+Что это даёт:
+
+· Пакеты numpy, pandas, requests можно устанавливать только в указанных диапазонах версий.
+· Все остальные пакеты (если они есть в зеркале или PyPI) не ограничены – это позволяет гибко контролировать только критичные зависимости.
+· Если нужно полностью запретить установку любого пакета, по-прежнему используйте block.
+
+---
+
+3. Управление constrained-правилами «на лету»
+
+После запуска можно обновлять ограничения без перезагрузки сервера:
+
+```bash
+# Задать новые constraints
+docker-compose exec devpi devpi login root --password=admin123
+docker-compose exec devpi devpi index root/prod constraints="numpy==1.23.5; pandas>=1.5,<2"
+
+# Посмотреть текущие ограничения
+docker-compose exec devpi devpi index root/prod | grep constraints
+
+# Удалить все constraints (оставить пустую строку)
+docker-compose exec devpi devpi index root/prod constraints=""
+```
+
+---
+
+4. Как это работает вместе с Bandersnatch и Nexus
+
+1. Bandersnatch выкачивает только пакеты из белого списка (например, numpy, pandas).
+2. Devpi (через индекс prod) объединяет зеркало и PyPI, автоматически добирая недостающее.
+3. Devpi-constrained на root/prod накладывает ограничения по версиям. Если пользователь запросит pip install numpy==1.20.0, Devpi ответит 404 Not Found, потому что версия 1.20.0 не попадает в ограничение >=1.21,<2.0.
+4. Nexus проксирует root/prod и может добавлять свои Routing Rules как последний рубеж.
+
+При необходимости можно создать несколько индексов с разными constraints для разных групп пользователей (например, prod-strict, prod-relaxed) и привязать их к разным URL в Nexus.
+
+---
+
+5. Полный пример структуры проекта
+
+```
+.
+├── docker-compose.yml          # nexus, devpi (build), bandersnatch, nginx
+├── Dockerfile.devpi             # на основе devpi с плагином
+├── devpi-init.sh                # инициализация индексов + constraints
+├── bandersnatch.conf
+└── nginx-default.conf
+```
+
+Таким образом, devpi-constrained добавляет элегантный способ централизованно задавать допустимые диапазоны версий для критических пакетов, не отказываясь от гибкого «добирания» новых пакетов и оперативных блокировок.

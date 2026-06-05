@@ -471,3 +471,90 @@ docker-compose exec devpi devpi index root/prod constraints=""
 ```
 
 Таким образом, devpi-constrained добавляет элегантный способ централизованно задавать допустимые диапазоны версий для критических пакетов, не отказываясь от гибкого «добирания» новых пакетов и оперативных блокировок.
+
+_____
+_____
+
+
+Образ devpi/devpi:latest может отсутствовать в Docker Hub — он был удалён или перемещён. Самый надёжный способ — собрать собственный образ на основе python, включив devpi-server, devpi-client и devpi-constrained. Это заодно решает проблему с плагином constrained.
+
+Ниже — обновлённый Dockerfile.devpi и изменения в docker-compose.yml.
+
+---
+
+1. Новый Dockerfile для Devpi (вместо FROM devpi/devpi:latest)
+
+```dockerfile
+# Dockerfile.devpi
+FROM python:3.11-slim
+
+# Установка devpi-сервера, клиента и плагина constrained
+RUN pip install --no-cache-dir \
+    devpi-server \
+    devpi-client \
+    devpi-constrained
+
+# Создаём рабочую директорию для данных
+RUN mkdir -p /data
+ENV DEVPISERVER_SERVERDIR=/data
+
+# Скрипт инициализации будет скопирован через docker-compose
+# Запуск сервера
+EXPOSE 3141
+CMD ["devpi-server", "--host", "0.0.0.0", "--port", "3141"]
+```
+
+---
+
+2. Обновлённый docker-compose.yml (фрагмент с devpi)
+
+```yaml
+devpi:
+  build:
+    context: .
+    dockerfile: Dockerfile.devpi
+  container_name: devpi
+  restart: unless-stopped
+  ports:
+    - "3141:3141"
+  volumes:
+    - devpi-data:/data
+    - ./devpi-init.sh:/docker-entrypoint-init.d/init.sh:ro
+  environment:
+    - DEVPISERVER_HOST=0.0.0.0
+    - DEVPISERVER_ROOT_PASSWORD=admin123
+  entrypoint: |
+    bash -c '
+      # Запускаем сервер в фоне, ждём, запускаем скрипт инициализации
+      devpi-server --host 0.0.0.0 --port 3141 &
+      sleep 5
+      if [ -f /docker-entrypoint-init.d/init.sh ]; then
+        bash /docker-entrypoint-init.d/init.sh
+      fi
+      wait
+    '
+  networks:
+    - pypi-net
+```
+
+Теперь при запуске docker-compose up -d образ будет собран автоматически.
+
+---
+
+3. Если хотите попробовать найти готовый образ
+
+Официальный образ переехал в GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/devpi/devpi:latest
+```
+
+Тогда в docker-compose.yml можно указать:
+
+```yaml
+devpi:
+  image: ghcr.io/devpi/devpi:latest
+  ...
+```
+
+Но рекомендуется вариант с собственным Dockerfile — он гарантирует наличие devpi-constrained и полную независимость от внешних образов.

@@ -769,3 +769,88 @@ docker-compose exec devpi devpi index root/prod
 · Полным управлением из командной строки.
 
 Никакие дополнительные сервисы (Nexus, Bandersnatch) не используются.
+
+
+______
+
+
+devpi-constrained не умеет блокировать все пакеты сразу — он работает с конкретными именами пакетов и задаёт допустимые диапазоны версий.
+Для полного запрета всех пакетов используется штатная команда Devpi:
+
+```bash
+devpi index root/prod "block*" "*"
+```
+
+После этого ни один пакет не будет доступен. Затем вы разрешаете только те, что нужны (белый список), и при необходимости накладываете на них ограничения версий через constraints.
+
+---
+
+1. Как это выглядит в devpi-init.sh
+
+Замените содержимое скрипта инициализации на:
+
+```bash
+#!/bin/bash
+sleep 5
+
+devpi use http://localhost:3141
+devpi login root --password ''
+devpi user -m root password="${DEVPISERVER_ROOT_PASSWORD:-admin123}"
+devpi login root --password="${DEVPISERVER_ROOT_PASSWORD:-admin123}"
+
+# Создаём прокси-индекс на PyPI (источник пакетов, если их разрешат)
+devpi index -c pypi type=mirror mirror_url="https://pypi.org/simple/"
+
+# Рабочий индекс с бэкендом PyPI, кеширование по запросу
+devpi index -c prod bases=root/pypi volatile=False
+
+# === ПОЛНЫЙ ЗАПРЕТ ВСЕХ ПАКЕТОВ ===
+devpi index root/prod "block*" "*"
+
+# === РАЗРЕШАЕМ ТОЛЬКО НУЖНЫЕ ПАКЕТЫ ===
+devpi index root/prod allow numpy
+devpi index root/prod allow pandas
+devpi index root/prod allow requests
+
+# === ОГРАНИЧИВАЕМ ВЕРСИИ ДЛЯ РАЗРЕШЁННЫХ ПАКЕТОВ (через constrained) ===
+devpi index root/prod constraints="numpy>=1.21,<2.0; pandas>=1.3,<2.0; requests==2.28.2"
+
+echo "Devpi setup complete: all packages blocked, only explicit allowed with constraints."
+```
+
+---
+
+2. Запуск
+
+```bash
+docker-compose up -d --build   # пересобрать образ и запустить
+```
+
+После старта:
+
+· pip install любого пакета, кроме numpy, pandas, requests, будет получать 404.
+· Для разрешённых пакетов будут доступны только версии, соответствующие constraints.
+· Если позже потребуется разрешить новый пакет, выполните:
+
+```bash
+docker-compose exec devpi devpi login root --password=admin123
+docker-compose exec devpi devpi index root/prod allow flask
+docker-compose exec devpi devpi index root/prod constraints="numpy>=1.21,<2.0; pandas>=1.3,<2.0; requests==2.28.2; flask>=2.0"
+```
+
+· Чтобы временно разрешить всё (убрать блокировку), используйте:
+
+```bash
+docker-compose exec devpi devpi index root/prod "allow*" "*"
+```
+
+---
+
+3. Как это работает технически
+
+· devpi block "*" вносит правило в индекс: все пакеты, соответствующие шаблону * (т.е. все), скрываются.
+· devpi allow <name> отменяет блокировку для конкретного пакета.
+· devpi constraints накладывает ограничения по версиям поверх уже разрешённых имён.
+· Кеширование остаётся «по запросу»: пакет загружается из PyPI только при первом pip install разрешённого пакета (и только допустимой версии).
+
+Таким образом, связка block "*" + allow даёт полноценный белый список имён, а devpi-constrained — белый список версий внутри этих имён.

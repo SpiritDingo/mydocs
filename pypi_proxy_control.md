@@ -558,3 +558,214 @@ devpi:
 ```
 
 Но рекомендуется вариант с собственным Dockerfile — он гарантирует наличие devpi-constrained и полную независимость от внешних образов.
+
+
+Вот готовое решение для автономного Devpi-сервера с плагином devpi-constrained, без Nexus и Bandersnatch.
+Кеширование — строго по запросу (первый pip install загружает пакет из PyPI, последующие отдаются из кеша).
+
+---
+
+Файлы проекта
+
+Создайте три файла в одной папке:
+
+1. Dockerfile.devpi
+
+```dockerfile
+FROM python:3.11-slim
+
+# Устанавливаем devpi и плагин constrained
+RUN pip install --no-cache-dir \
+    devpi-server \
+    devpi-client \
+    devpi-constrained
+
+RUN mkdir -p /data
+ENV DEVPISERVER_SERVERDIR=/data
+
+EXPOSE 3141
+CMD ["devpi-server", "--host", "0.0.0.0", "--port", "3141"]
+```
+
+2. docker-compose.yml
+
+```yaml
+version: "3.8"
+
+services:
+  devpi:
+    build:
+      context: .
+      dockerfile: Dockerfile.devpi
+    container_name: devpi
+    restart: unless-stopped
+    ports:
+      - "3141:3141"
+    volumes:
+      - devpi-data:/data
+      - ./devpi-init.sh:/docker-entrypoint-init.d/init.sh:ro
+    environment:
+      - DEVPISERVER_ROOT_PASSWORD=admin123
+    entrypoint: |
+      bash -c '
+        devpi-server --host 0.0.0.0 --port 3141 &
+        sleep 5
+        if [ -f /docker-entrypoint-init.d/init.sh ]; then
+          bash /docker-entrypoint-init.d/init.sh
+        fi
+        wait
+      '
+    networks:
+      - devpi-net
+
+volumes:
+  devpi-data:
+
+networks:
+  devpi-net:
+    driver: bridge
+```
+
+3. devpi-init.sh – начальная настройка индекса
+
+```bash
+#!/bin/bash
+sleep 5
+
+# Подключаемся к локальному серверу
+devpi use http://localhost:3141
+devpi login root --password ''
+devpi user -m root password="${DEVPISERVER_ROOT_PASSWORD:-admin123}"
+devpi login root --password="${DEVPISERVER_ROOT_PASSWORD:-admin123}"
+
+# Создаём зеркалирующий индекс PyPI (если его ещё нет)
+devpi index -c pypi type=mirror mirror_url="https://pypi.org/simple/"
+
+# Рабочий индекс, который будет кешировать пакеты по запросу
+devpi index -c prod bases=root/pypi volatile=False
+
+# === ЧЁРНЫЙ СПИСОК ПАКЕТОВ (block) ===
+devpi index root/prod block oldpackage
+devpi index root/prod "block*" "test-*"            # все, начинающиеся с test-
+
+# === БЕЛЫЙ СПИСОК ЧЕРЕЗ CONSTRAINTS ===
+# Ограничиваем версии только для разрешённых пакетов.
+# Все остальные пакеты остаются доступными (если не заблокированы).
+devpi index root/prod constraints="numpy>=1.21,<2.0; pandas>=1.3,<2.0; requests>=2.25"
+
+echo "Devpi setup complete."
+```
+
+---
+
+Запуск
+
+```bash
+# Собрать образ и запустить сервис
+docker-compose up -d
+
+# Проверить логи
+docker-compose logs -f devpi
+```
+
+Сервер будет доступен на http://localhost:3141.
+Пользователь root с паролем admin123.
+
+---
+
+Использование с pip
+
+```bash
+# Установка пакета через Devpi
+pip install --index-url http://localhost:3141/root/prod/+simple/ numpy
+
+# Или если настроена переменная окружения
+export PIP_INDEX_URL=http://localhost:3141/root/prod/+simple/
+pip install pandas
+```
+
+---
+
+Управление чёрными и белыми списками
+
+Все команды выполняются внутри контейнера или через docker-compose exec devpi ....
+
+Чёрный список пакетов
+
+Блокировка делает пакет полностью недоступным (клиенты получат 404).
+
+```bash
+# Блокировать один пакет
+docker-compose exec devpi devpi login root --password=admin123
+docker-compose exec devpi devpi index root/prod block some-package
+
+# Блокировать по маске
+docker-compose exec devpi devpi index root/prod "block*" "dev-*"
+```
+
+Белый список (разрешить только определённые пакеты)
+
+Devpi не имеет встроенного «белого списка» для имён пакетов.
+На практике это можно сделать двумя способами:
+
+Способ 1 – через constraints (рекомендуемый)
+Оставьте индекс открытым (доступны все пакеты), но ограничьте версии только нужных.
+Пользователи смогут установить любой пакет, но для разрешённых пакетов будут действовать только заданные диапазоны версий. Нежелательные пакеты можно заблокировать через block.
+
+Способ 2 – жёсткий белый список
+Заблокируйте все пакеты, кроме нужных. Для этого нужно перечислить запрещённые пакеты (неудобно), либо использовать внешний инструмент (например, nginx с allow/deny). В рамках автономного Devpi можно периодически блокировать «всё новое» скриптом.
+
+Пример: белый список через полный запрет нежелательных
+
+1. Заблокируйте маски всех нежелательных пакетов в devpi-init.sh:
+
+```bash
+devpi index root/prod "block*" "my-private-*"   # запретить префикс
+```
+
+2. Для разрешённых пакетов задайте constraints:
+
+```bash
+devpi index root/prod constraints="my-package==1.0"
+```
+
+Теперь my-package доступен только в версии 1.0, а всё, что начинается с my-private-, заблокировано. Остальной PyPI остаётся открытым (это можно регулировать дополнительными block).
+
+---
+
+Управление constraints (динамически)
+
+Constraints можно менять в любое время без перезапуска.
+
+```bash
+# Установить новые ограничения
+docker-compose exec devpi devpi index root/prod constraints="numpy==1.23.5; pandas>=1.5"
+
+# Удалить все ограничения
+docker-compose exec devpi devpi index root/prod constraints=""
+
+# Посмотреть текущие
+docker-compose exec devpi devpi index root/prod
+```
+
+---
+
+Как работает кеширование «по запросу»
+
+· При первом pip install <package> Devpi загружает пакет из PyPI и сохраняет в /data.
+· Следующие установки этого пакета (любой разрешённой версии) идут уже из локального кеша.
+· Никакой предварительной синхронизации не требуется.
+· Если интернет пропадает, ранее закешированные пакеты продолжают работать.
+
+---
+
+Резюме
+
+Вы получили лёгкий, автономный PyPI-прокси с:
+
+· Кешированием только по запросу.
+· Чёрными списками пакетов через block.
+· Гибкими ограничениями версий (белый список версий) через devpi-constrained.
+· Полным управлением из командной строки.
+
+Никакие дополнительные сервисы (Nexus, Bandersnatch) не используются.

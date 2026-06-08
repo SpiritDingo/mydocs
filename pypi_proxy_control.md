@@ -1443,3 +1443,169 @@ docker-compose exec devpi devpi index root/prod constraints+="flask>=2.0"
 ```
 
 Итог: белые/чёрные списки управляются через единый файл constraints.txt, что удобно для версионирования и автоматизации. Кеширование остаётся ленивым (по запросу). Все ошибки аутентификации и готовности сервера устранены.
+
+______
+______
+
+Для поддержки нескольких проектов с изолированными наборами пакетов каждый проект получает собственный constrained-индекс в Devpi. Индексы создаются на основе единого зеркала root/pypi, но фильтруются независимыми файлами ограничений.
+
+---
+
+1. Структура проекта
+
+```
+.
+├── Dockerfile.devpi
+├── docker-compose.yml
+├── devpi-init.sh
+└── projects/                  # по одному каталогу на проект
+    ├── project-alpha/
+    │   └── constraints.txt
+    └── project-beta/
+        └── constraints.txt
+```
+
+Пример constraints.txt для project-alpha:
+
+```
+# Запретить всё, кроме перечисленного
+*
+numpy>=1.21,<2.0
+pandas==1.5.3
+requests
+```
+
+Для project-beta:
+
+```
+*
+flask>=2.0
+django==4.2
+```
+
+---
+
+2. devpi-init.sh – автоматическое создание индексов
+
+```bash
+#!/bin/bash
+set -e
+echo "Waiting for devpi server..."
+sleep 3
+
+devpi use http://localhost:3141
+
+# Аутентификация (первый запуск или с паролем)
+if devpi login root --password='' 2>/dev/null; then
+    devpi user -m root password="${DEVPISERVER_ROOT_PASSWORD:-admin123}"
+    devpi login root --password="${DEVPISERVER_ROOT_PASSWORD:-admin123}"
+else
+    devpi login root --password="${DEVPISERVER_ROOT_PASSWORD:-admin123}"
+fi
+
+# Зеркало PyPI (единое для всех)
+if ! devpi index -l | grep -q 'root/pypi'; then
+    devpi index -c pypi type=mirror mirror_url="https://pypi.org/simple/"
+fi
+
+# Создание индексов для каждого проекта из папки projects/
+if [ -d /docker-entrypoint-init.d/projects ]; then
+    for project_dir in /docker-entrypoint-init.d/projects/*/; do
+        project_name=$(basename "$project_dir")
+        index_name="root/${project_name}"
+
+        if ! devpi index -l | grep -q "$index_name"; then
+            devpi index -c "$project_name" type=constrained bases=root/pypi volatile=False
+        fi
+
+        if [ -f "${project_dir}constraints.txt" ]; then
+            echo "Applying constraints for $project_name..."
+            constraints=$(tr '\n' ',' < "${project_dir}constraints.txt" | sed 's/,$//' | sed 's/,/, /g')
+            devpi index "$index_name" constraints="$constraints"
+        else
+            echo "No constraints.txt for $project_name, skipping."
+        fi
+    done
+fi
+
+echo "All project indexes configured."
+```
+
+Пояснение:
+
+· Каждый подкаталог в projects/ становится индексом root/<имя_папки>.
+· Содержимое constraints.txt преобразуется в строку через запятую (переносы строк → , ) и присваивается индексу.
+· Сначала идёт * (запретить всё), затем разрешённые пакеты – классический белый список.
+
+---
+
+3. docker-compose.yml (фрагмент)
+
+```yaml
+services:
+  devpi:
+    build:
+      context: .
+      dockerfile: Dockerfile.devpi
+    container_name: devpi
+    restart: unless-stopped
+    ports:
+      - "3141:3141"
+    volumes:
+      - devpi-data:/data
+      - ./devpi-init.sh:/docker-entrypoint-init.d/init.sh:ro
+      - ./projects:/docker-entrypoint-init.d/projects:ro   # <-- все проекты
+    environment:
+      - DEVPISERVER_ROOT_PASSWORD=admin123
+    entrypoint: ... (как ранее)
+```
+
+---
+
+4. Использование клиентами
+
+Каждый проект указывает свой индекс:
+
+```bash
+# Проект Alpha
+pip install --index-url http://devpi:3141/root/project-alpha/+simple/ numpy
+
+# Проект Beta
+pip install --index-url http://devpi:3141/root/project-beta/+simple/ flask
+```
+
+Пакеты, не перечисленные в constraints.txt, недоступны (блокированы символом *).
+
+---
+
+5. Динамическое добавление проекта
+
+1. Создайте новую папку в projects/, например project-gamma.
+2. Положите в неё constraints.txt.
+3. Выполните инициализацию индекса и установку ограничений:
+
+```bash
+docker-compose exec devpi bash
+devpi login root --password=admin123
+devpi index -c project-gamma type=constrained bases=root/pypi
+cat /docker-entrypoint-init.d/projects/project-gamma/constraints.txt | tr '\n' ',' | sed 's/,$//' | xargs -I{} devpi index root/project-gamma constraints="{}"
+```
+
+Можно автоматизировать скриптом в хосте.
+
+---
+
+6. Редактирование ограничений
+
+Измените файл constraints.txt нужного проекта и примените:
+
+```bash
+docker-compose exec devpi devpi login root --password=admin123
+docker-compose exec devpi devpi index root/project-alpha constraints="$(cat projects/project-alpha/constraints.txt | tr '\n' ',' | sed 's/,$//')"
+```
+
+После этого индекс мгновенно обновляется, перезапуск не требуется.
+
+---
+
+Такая архитектура даёт полностью изолированные друг от друга «белые списки» пакетов для любого количества команд, при этом используется один экземпляр Devpi с плагином constrained и кешированием по запросу.

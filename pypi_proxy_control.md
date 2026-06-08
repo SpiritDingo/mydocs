@@ -1173,3 +1173,184 @@ docker-compose up -d --build
 ```
 
 Теперь решение полностью соответствует документации devpi-constrained, а управление белыми списками реализовано через constraints без block/allow.
+
+_____
+_____
+_____
+_____
+
+Ошибка 401 Unauthorized возникает, потому что скрипт инициализации не смог аутентифицироваться.
+Причина: после первого запуска пароль root уже изменён, а скрипт пытается войти с пустым паролем.
+
+Ниже — исправленные файлы с устойчивой аутентификацией и корректным ожиданием сервера.
+
+---
+
+1. Dockerfile.devpi – добавлен curl для проверки готовности
+
+```dockerfile
+FROM python:3.11-slim
+
+# Устанавливаем curl (нужен для healthcheck в entrypoint)
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir \
+    devpi-server \
+    devpi-client \
+    devpi-constrained
+
+RUN mkdir -p /data
+ENV DEVPISERVER_SERVERDIR=/data
+
+EXPOSE 3141
+CMD ["devpi-server", "--host", "0.0.0.0", "--port", "3141"]
+```
+
+---
+
+2. docker-compose.yml – надёжный запуск
+
+```yaml
+version: "3.8"
+
+services:
+  devpi:
+    build:
+      context: .
+      dockerfile: Dockerfile.devpi
+    container_name: devpi
+    restart: unless-stopped
+    ports:
+      - "3141:3141"
+    volumes:
+      - devpi-data:/data
+      - ./devpi-init.sh:/docker-entrypoint-init.d/init.sh:ro
+    environment:
+      - DEVPISERVER_ROOT_PASSWORD=admin123
+    entrypoint: |
+      bash -c '
+        # Инициализация данных при первом запуске
+        if [ ! -f /data/.nodeinfo ]; then
+          echo "Initializing devpi data directory..."
+          devpi-init
+        fi
+
+        # Запуск сервера в фоне
+        devpi-server --host 0.0.0.0 --port 3141 &
+        SERVER_PID=$!
+
+        # Ожидание, пока API не ответит 200 OK (максимум 30 секунд)
+        echo "Waiting for devpi server to start..."
+        for i in $$(seq 1 30); do
+          if curl -s -o /dev/null -w "%{http_code}" http://localhost:3141/+api | grep -q 200; then
+            echo "Devpi server is ready."
+            break
+          fi
+          sleep 1
+        done
+
+        # Запуск скрипта настройки
+        if [ -f /docker-entrypoint-init.d/init.sh ]; then
+          echo "Running initialization script..."
+          bash /docker-entrypoint-init.d/init.sh
+        fi
+
+        # Возвращаем управление серверу
+        wait $SERVER_PID
+      '
+    networks:
+      - devpi-net
+
+volumes:
+  devpi-data:
+
+networks:
+  devpi-net:
+    driver: bridge
+```
+
+---
+
+3. devpi-init.sh – умная аутентификация и constrained-индекс
+
+```bash
+#!/bin/bash
+set -e
+
+echo "Waiting for devpi server to be ready..."
+sleep 3
+
+devpi use http://localhost:3141
+
+# Пробуем войти с пустым паролем (первый запуск)
+if devpi login root --password='' 2>/dev/null; then
+    echo "First time setup: setting root password."
+    devpi user -m root password="${DEVPISERVER_ROOT_PASSWORD:-admin123}"
+    # После смены пароля перелогиниваемся
+    devpi login root --password="${DEVPISERVER_ROOT_PASSWORD:-admin123}"
+else
+    # Иначе входим с заданным паролем
+    echo "Logging in with provided password."
+    devpi login root --password="${DEVPISERVER_ROOT_PASSWORD:-admin123}"
+fi
+
+# Создаём зеркало PyPI (если отсутствует)
+if ! devpi index -l | grep -q 'root/pypi'; then
+    devpi index -c pypi type=mirror mirror_url="https://pypi.org/simple/"
+fi
+
+# Создаём constrained-индекс prod (если отсутствует)
+if ! devpi index -l | grep -q 'root/prod'; then
+    devpi index -c prod type=constrained bases=root/pypi volatile=False
+fi
+
+# Устанавливаем ограничения: * (всё запрещено), затем белый список с версиями
+devpi index root/prod constraints="*, numpy>=1.21,<2.0, pandas>=1.3,<2.0, requests==2.28.2"
+
+echo "Devpi constrained index setup complete."
+```
+
+---
+
+Запуск и проверка
+
+```bash
+docker-compose up -d --build
+docker-compose logs -f devpi   # убедимся, что нет ошибок
+```
+
+Тестирование через pip
+
+```bash
+# Разрешённый пакет
+pip install --index-url http://localhost:3141/root/prod/+simple/ numpy==1.21.6
+
+# Запрещённый (не в constraints)
+pip install --index-url http://localhost:3141/root/prod/+simple/ flask
+# Ошибка: Could not find a version...
+
+# Разрешённый, но версия вне диапазона
+pip install --index-url http://localhost:3141/root/prod/+simple/ pandas==2.0.0
+# Ошибка: Could not find a version...
+```
+
+---
+
+Динамическое управление белым списком
+
+```bash
+docker-compose exec devpi bash
+devpi login root --password=admin123
+
+# Добавить новый пакет
+devpi index root/prod constraints+="flask>=2.0"
+
+# Посмотреть текущие constraints
+devpi index root/prod | grep constraints
+
+# Сбросить ограничения (разрешить всё)
+devpi index root/prod constraints=""
+```
+
+Теперь чёрный список реализован через constraints="*", а белый список — через перечисление разрешённых пакетов с версиями.
+Кеширование по запросу сохраняется (первая загрузка из PyPI, затем из кеша).

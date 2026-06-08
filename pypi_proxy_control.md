@@ -854,3 +854,215 @@ docker-compose exec devpi devpi index root/prod "allow*" "*"
 · Кеширование остаётся «по запросу»: пакет загружается из PyPI только при первом pip install разрешённого пакета (и только допустимой версии).
 
 Таким образом, связка block "*" + allow даёт полноценный белый список имён, а devpi-constrained — белый список версий внутри этих имён.
+_____
+_____
+_____
+
+Ошибки, которые вы привели, связаны с порядком запуска, недостаточным ожиданием готовности сервера и неправильным синтаксисом команд block/allow в Devpi. Ниже – разбор каждой проблемы и исправленный комплект файлов.
+
+---
+
+Что было не так
+
+1. Сервер не успевает подняться
+      sleep 5 может быть недостаточно. В логах: Connection refused, значит devpi-server ещё не слушает порт.
+2. Нет инициализации /data
+      Devpi требует, чтобы директория данных была проинициализирована (файлы .nodeinfo, база данных). При первом запуске нужно выполнить devpi-init, иначе сервер вылетает с fatal: The path '/data' contains no devpi-server data.
+3. Синтаксис block* и allow
+      Devpi ожидает аргументы в формате ИМЯ=ЗНАЧЕНИЕ:
+   · Правильно: devpi index root/prod "block*"="*"
+   · Правильно: devpi index root/prod allow="numpy"
+        Ваш вызов devpi index root/prod allow numpy вызывал ошибку arguments must be format NAME=VALUE.
+4. Сбой аутентификации
+      Из-за невозможности подключиться к серверу devpi login не срабатывал, и последующие команды получали no current authenticated user.
+
+---
+
+Исправленное решение
+
+1. Dockerfile.devpi (без изменений)
+
+```dockerfile
+FROM python:3.11-slim
+
+RUN pip install --no-cache-dir \
+    devpi-server \
+    devpi-client \
+    devpi-constrained
+
+RUN mkdir -p /data
+ENV DEVPISERVER_SERVERDIR=/data
+
+EXPOSE 3141
+CMD ["devpi-server", "--host", "0.0.0.0", "--port", "3141"]
+```
+
+2. docker-compose.yml (entrypoint с автоинициализацией)
+
+```yaml
+version: "3.8"
+
+services:
+  devpi:
+    build:
+      context: .
+      dockerfile: Dockerfile.devpi
+    container_name: devpi
+    restart: unless-stopped
+    ports:
+      - "3141:3141"
+    volumes:
+      - devpi-data:/data
+      - ./devpi-init.sh:/docker-entrypoint-init.d/init.sh:ro
+    environment:
+      - DEVPISERVER_ROOT_PASSWORD=admin123
+    entrypoint: |
+      bash -c '
+        # Если папка с данными пуста – инициализируем
+        if [ ! -f /data/.nodeinfo ]; then
+          echo "Initializing devpi data directory..."
+          devpi-init
+        fi
+
+        # Запускаем сервер в фоне и ждём готовности
+        devpi-server --host 0.0.0.0 --port 3141 &
+        SERVER_PID=$!
+
+        # Ждём, пока сервер не начнёт отвечать (с таймаутом ~30 сек)
+        for i in {1..30}; do
+          if curl -s http://localhost:3141/+api >/dev/null 2>&1; then
+            break
+          fi
+          sleep 1
+        done
+
+        # Выполняем скрипт настройки (если он есть)
+        if [ -f /docker-entrypoint-init.d/init.sh ]; then
+          bash /docker-entrypoint-init.d/init.sh
+        fi
+
+        # Переводим сервер в foreground
+        wait $SERVER_PID
+      '
+    networks:
+      - devpi-net
+
+volumes:
+  devpi-data:
+
+networks:
+  devpi-net:
+    driver: bridge
+```
+
+3. devpi-init.sh – корректная настройка
+
+```bash
+#!/bin/bash
+set -e
+
+# Функция проверки аутентификации и повторного входа при необходимости
+devpi_ensure_login() {
+    if ! devpi use http://localhost:3141 2>/dev/null | grep -q "logged in"; then
+        devpi login root --password="${DEVPISERVER_ROOT_PASSWORD:-admin123}"
+    fi
+}
+
+echo "Waiting for devpi server to be fully ready..."
+# Сервер уже должен быть доступен благодаря циклу в entrypoint, но добавим ещё небольшую паузу
+sleep 2
+
+# Первоначальная настройка
+devpi use http://localhost:3141
+devpi login root --password="${DEVPISERVER_ROOT_PASSWORD:-admin123}"
+devpi user -m root password="${DEVPISERVER_ROOT_PASSWORD:-admin123}" || true
+devpi_ensure_login
+
+# Создаём базовый прокси-индекс на PyPI (если его ещё нет)
+if ! devpi index -l | grep -q 'root/pypi'; then
+    devpi index -c pypi type=mirror mirror_url="https://pypi.org/simple/"
+fi
+
+# Создаём рабочий индекс prod (если отсутствует)
+if ! devpi index -l | grep -q 'root/prod'; then
+    devpi index -c prod bases=root/pypi volatile=False
+fi
+
+# Переключаемся на prod
+devpi use root/prod
+
+# === ПОЛНАЯ БЛОКИРОВКА ВСЕХ ПАКЕТОВ ===
+devpi index root/prod "block*"="*"
+
+# === РАЗРЕШАЕМ ТОЛЬКО НУЖНЫЕ ===
+devpi index root/prod allow="numpy"
+devpi index root/prod allow="pandas"
+devpi index root/prod allow="requests"
+
+# === ОГРАНИЧЕНИЯ ВЕРСИЙ (constrained) ===
+devpi index root/prod constraints="numpy>=1.21,<2.0; pandas>=1.3,<2.0; requests==2.28.2"
+
+echo "Devpi setup complete: all packages blocked, only allowed ones are: numpy, pandas, requests with version constraints."
+```
+
+---
+
+Как запустить
+
+1. Скопируйте три файла (Dockerfile.devpi, docker-compose.yml, devpi-init.sh) в одну папку.
+2. Выполните docker-compose up -d --build.
+3. Проверьте логи: docker-compose logs -f devpi. Вы должны увидеть сообщение об успешной настройке.
+
+---
+
+Проверка работы
+
+```bash
+# Установка разрешённого пакета (успех)
+pip install --index-url http://localhost:3141/root/prod/+simple/ numpy==1.21.6
+
+# Попытка установить заблокированный пакет (ошибка 404)
+pip install --index-url http://localhost:3141/root/prod/+simple/ flask
+# -> ERROR: Could not find a version that satisfies the requirement flask (from versions: none)
+
+# Попытка установить разрешённый, но версию вне ограничений (ошибка 404)
+pip install --index-url http://localhost:3141/root/prod/+simple/ pandas==2.0.0
+# -> ERROR: Could not find a version that satisfies the requirement pandas==2.0.0 (from versions: none)
+```
+
+---
+
+Управление после запуска (через контейнер)
+
+```bash
+# Войти в контейнер
+docker-compose exec devpi bash
+
+# Авторизоваться
+devpi login root --password=admin123
+
+# Посмотреть текущие настройки индекса prod
+devpi index root/prod
+
+# Разрешить ещё один пакет
+devpi index root/prod allow="flask"
+devpi index root/prod constraints="flask>=2.0"
+
+# Снова всё заблокировать (кроме уже разрешённых, после этого flask не исчезнет)
+# Для временной разблокировки всех (снятие ограничений):
+devpi index root/prod "allow*"="*"
+
+# Полностью очистить списки блокировок и разрешений:
+devpi index root/prod "block*"=""   # удалить все шаблоны блокировки
+```
+
+---
+
+Коротко об исправлениях
+
+· Добавлена автоматическая инициализация (devpi-init) при первом запуске.
+· Реализовано надёжное ожидание сервера через curl в entrypoint.
+· Исправлен синтаксис block* и allow на "block*"="*" и allow="numpy".
+· Устранены проблемы аутентификации и неподключённого клиента.
+
+Теперь Devpi‑сервер с плагином constrained работает изолированно, кеширует только запрошенные пакеты и жёстко фильтрует по белому списку имён и версий.

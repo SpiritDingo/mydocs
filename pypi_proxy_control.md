@@ -1354,3 +1354,92 @@ devpi index root/prod constraints=""
 
 Теперь чёрный список реализован через constraints="*", а белый список — через перечисление разрешённых пакетов с версиями.
 Кеширование по запросу сохраняется (первая загрузка из PyPI, затем из кеша).
+
+_______
+_______
+
+
+Для централизованного управления ограничениями через файл (как описано в документации devpi-constrained) добавьте файл constraints.txt в проект и подключите его в контейнер. Ниже — полный рецепт.
+
+---
+
+1. Создайте файл constraints.txt
+
+Пример содержимого (одно ограничение на строку, можно комментарии):
+
+```text
+# Запретить всё, чего нет в списке
+*
+# Разрешённые пакеты с версиями
+numpy>=1.21,<2.0
+pandas>=1.3,<2.0
+requests==2.28.2
+# flask разрешён без ограничений по версии (если добавить позже)
+```
+
+Порядок важен: * должен идти первым, чтобы перекрыть все неупомянутые пакеты.
+
+---
+
+2. Подключите файл в Docker Compose
+
+Добавьте ещё один volume в сервис devpi:
+
+```yaml
+    volumes:
+      - devpi-data:/data
+      - ./devpi-init.sh:/docker-entrypoint-init.d/init.sh:ro
+      - ./constraints.txt:/docker-entrypoint-init.d/constraints.txt:ro   # <-- новый том
+```
+
+---
+
+3. Измените devpi-init.sh для чтения файла
+
+Замените жёстко прописанные constraints на загрузку из файла:
+
+```bash
+# ... (предыдущие строки до создания индекса prod)
+
+# Устанавливаем ограничения из файла
+if [ -f /docker-entrypoint-init.d/constraints.txt ]; then
+    devpi index root/prod constraints="$(cat /docker-entrypoint-init.d/constraints.txt)"
+else
+    # fallback, если файл отсутствует
+    devpi index root/prod constraints="*, numpy>=1.21,<2.0, pandas>=1.3,<2.0, requests==2.28.2"
+fi
+
+echo "Devpi constrained index setup complete."
+```
+
+---
+
+4. Применение и обновление ограничений «на лету»
+
+После редактирования constraints.txt на хосте выполните:
+
+```bash
+# Загрузить новые ограничения из файла
+docker-compose exec devpi devpi login root --password=admin123
+docker-compose exec devpi devpi index root/prod constraints="$(cat constraints.txt)"
+```
+
+Или, если хотите добавить только один пакет (не перезаписывая файл):
+
+```bash
+docker-compose exec devpi devpi index root/prod constraints+="flask>=2.0"
+```
+
+---
+
+Полная структура проекта после всех исправлений
+
+```
+.
+├── Dockerfile.devpi
+├── docker-compose.yml
+├── devpi-init.sh
+└── constraints.txt
+```
+
+Итог: белые/чёрные списки управляются через единый файл constraints.txt, что удобно для версионирования и автоматизации. Кеширование остаётся ленивым (по запросу). Все ошибки аутентификации и готовности сервера устранены.

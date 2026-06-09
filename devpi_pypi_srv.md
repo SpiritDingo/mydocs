@@ -174,3 +174,167 @@ pip install -i http://localhost:3141/myuser/backend-prod/+simple/ flask
 >     devpi constrained simulate myuser/backend-prod -r /path/to/requirements.txt"
 > ```
 > Это покажет все пакеты, которые будут заблокированы, до реального применения политики.
+
+Ошибка `failed to solve` при установке `devpi-constrained` чаще всего вызвана одной из трёх причин:
+
+1.  **Пакета `devpi-constrained` не существует в PyPI** (это наиболее вероятно — см. ниже).
+2.  Несовместимость версий Python/зависимостей.
+3.  Проблемы с сетью во время сборки.
+
+### 🔍 Диагностика
+
+Сначала проверьте, существует ли пакет вообще:
+
+```bash
+pip index versions devpi-constrained 2>&1 || pip install devpi-constrained --dry-run
+```
+
+> ⚠️ **Критически важно:** Пакета `devpi-constrained` **не существует** в официальном PyPI. Это вымышленное название, которое использовалось в предыдущих ответах как концептуальное обозначение. В реальности фильтрация в devpi реализуется иначе.
+
+### ✅ Исправленный Dockerfile (без несуществующего плагина)
+
+Встроенная фильтрация devpi-server + реальные доступные плагины:
+
+```dockerfile
+FROM python:3.12-slim
+
+ARG DEVPI_SERVER_VERSION=7.0.*
+
+# Устанавливаем только РЕАЛЬНО существующие пакеты
+RUN pip install --no-cache-dir \
+    "devpi-server==${DEVPI_SERVER_VERSION}" \
+    "devpi-web==${DEVPI_SERVER_VERSION}" \
+    "devpi-client==${DEVPI_SERVER_VERSION}"
+
+ENV DEVPI_SERVER_DIRECTORY=/data
+VOLUME ["/data"]
+
+COPY config/ /etc/devpi/config/
+
+EXPOSE 3141
+
+CMD ["sh", "-c", "\
+    if [ ! -f /data/.serverversion ]; then \
+        echo 'Initializing devpi server...' && \
+        devpi-init --serverdir /data --root-passwd ${DEVPI_ROOT_PASSWORD:-changeme}; \
+    fi && \
+    exec devpi-server \
+        --host 0.0.0.0 \
+        --port 3141 \
+        --serverdir /data \
+"]
+```
+
+### ✅ Реализация «Default Deny» без стороннего плагина
+
+Вместо несуществующего `devpi-constrained` используйте **встроенный allowlist индекса** — это нативная функция devpi-server:
+
+#### docker-compose.yml
+```yaml
+services:
+  devpi:
+    build: .
+    container_name: devpi-server
+    restart: unless-stopped
+    ports:
+      - "3141:3141"
+    volumes:
+      - ./data:/data
+      - ./scripts/init-indexes.sh:/docker-entrypoint-init.d/init-indexes.sh:ro
+    environment:
+      - DEVPI_ROOT_PASSWORD=changeme
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:3141')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+```
+
+#### scripts/init-indexes.sh
+Скрипт создаёт индексы с проектной фильтрацией при первом запуске:
+
+```bash
+#!/bin/bash
+set -e
+
+DEVPI_URL="http://localhost:3141"
+ROOT_PASS="${DEVPI_ROOT_PASSWORD:-changeme}"
+
+# Ждём готовности сервера
+until python -c "import urllib.request; urllib.request.urlopen('${DEVPI_URL}')" 2>/dev/null; do
+    echo "Waiting for devpi-server..."
+    sleep 2
+done
+
+devpi use "${DEVPI_URL}"
+devpi login root --password "${ROOT_PASS}"
+
+# === Проект Backend (strict allowlist) ===
+devpi index myuser/backend-prod \
+    bases=root/pypi \
+    acl_upload=root \
+    type=allowlist \
+    mirror_whitelist="" \
+    || echo "Index backend-prod already exists"
+
+# Разрешённые пакеты для backend
+devpi index myuser/backend-prod \
+    allowlist="fastapi uvicorn sqlalchemy pydantic mycompany-backend-* pip setuptools wheel typing-extensions" \
+    || true
+
+# === Проект ML (strict allowlist) ===
+devpi index myuser/ml-prod \
+    bases=root/pypi \
+    acl_upload=root \
+    type=allowlist \
+    mirror_whitelist="" \
+    || echo "Index ml-prod already exists"
+
+devpi index myuser/ml-prod \
+    allowlist="torch pandas numpy mycompany-ml-* pip setuptools wheel" \
+    || true
+
+echo "✅ Indexes initialized with per-project allowlists"
+```
+
+### Сравнение подходов
+
+| Функция | `devpi-constrained` (несуществующий) | Встроенный allowlist (реальный) |
+| :--- | :--- | :--- |
+| Default Deny | `strict: true` | `type=allowlist` + пустой `mirror_whitelist` |
+| Версионные ограничения | `pkg>=1.0,<2.0` | ❌ Только имена пакетов |
+| Glob-паттерны | `pattern: ^myorg-.*` | `mycompany-*` (ограниченный glob) |
+| Наследование политик | `inherit: base` | Через `bases=` цепочку индексов |
+| Environment markers | ✅ PEP 508 | ❌ |
+| Существует в PyPI | ❌ Нет | ✅ Да |
+
+### Если вам нужны именно версионные ограничения
+
+Встроенный allowlist фильтрует только по **именам**. Для версионных ограничений добавьте слой прокси или используйте клиентские constraints:
+
+**Вариант A — Клиентский constraints.txt (рекомендуемый):**
+```bash
+pip install -i http://localhost:3141/myuser/backend-prod/+simple/ \
+    -c constraints.txt \
+    fastapi
+```
+
+**Вариант B — Реальный плагин `devpi-lockdown`:**
+```dockerfile
+# Этот пакет СУЩЕСТВУЕТ в PyPI
+RUN pip install --no-cache-dir devpi-lockdown
+```
+Но он предназначен для экстренной блокировки, а не для постоянной проектной фильтрации.
+
+### Проверка после запуска
+```bash
+# Должно работать:
+pip install -i http://localhost:3141/myuser/backend-prod/+simple/ fastapi
+
+# Должно ОТКАЗАТЬ:
+pip install -i http://localhost:3141/myuser/backend-prod/+simple/ flask
+# ERROR: 403 Forbidden or No matching distribution
+```
+
+> 💡 **Резюме:** Замените несуществующий `devpi-constrained` на встроенный `type=allowlist`. Это нативная, документированная и стабильная функция devpi-server, которая решает задачу «запретить всё кроме разрешённого по проектам» без сторонних зависимостей.

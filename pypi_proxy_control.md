@@ -1609,3 +1609,73 @@ docker-compose exec devpi devpi index root/project-alpha constraints="$(cat proj
 ---
 
 Такая архитектура даёт полностью изолированные друг от друга «белые списки» пакетов для любого количества команд, при этом используется один экземпляр Devpi с плагином constrained и кешированием по запросу.
+
+_____
+_____
+
+Ошибка 400 Bad Request при применении constraints вызвана тем, что символ * (блокировка всего, что не перечислено) должен стоять последним в списке ограничений, а не первым.
+
+Сейчас после преобразования файла получается:
+*,numpy>=1.21,<2.0,pandas==1.1.5,requests — парсер devpi-constrained ожидает имя пакета в начале, а не *.
+
+---
+
+Исправление
+
+1. Измените порядок строк в файлах constraints.txt
+
+Для каждого проекта переместите * в конец файла:
+
+Было:
+
+```
+*
+numpy>=1.21,<2.0
+pandas==1.1.5
+requests
+```
+
+Стало:
+
+```
+numpy>=1.21,<2.0
+pandas==1.1.5
+requests
+*
+```
+
+2. Примените обновлённые ограничения
+
+Для конкретного проекта (например, dev) выполните:
+
+```bash
+docker-compose exec devpi devpi login root --password=admin123
+docker-compose exec devpi devpi index root/dev constraints="numpy>=1.21,<2.0,pandas==1.1.5,requests,*"
+```
+
+Или, используя сам файл (теперь он корректен):
+
+```bash
+cat projects/dev/constraints.txt | tr '\n' ',' | sed 's/,$//' | xargs -I{} docker-compose exec devpi devpi index root/dev constraints="{}"
+```
+
+---
+
+Почему так
+
+Спецификация constraints в devpi-constrained принимает строку, где * означает «заблокировать все остальные пакеты». Однако парсер ожидает, что первым в списке будет конкретное имя пакета, а * — последним элементом (по аналогии с pip==6.0,* в документации).
+
+После изменения порядка ошибка исчезнет, и индекс будет работать как белый список: разрешены только перечисленные пакеты, все остальные — 404.
+
+---
+
+Проверка
+
+```bash
+pip install --index-url http://localhost:3141/root/dev/+simple/ numpy
+# OK
+pip install --index-url http://localhost:3141/root/dev/+simple/ flask
+# Could not find a version...
+```
+
+Теперь можно создавать сколько угодно проектов — просто соблюдайте порядок строк в их constraints.txt.

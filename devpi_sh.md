@@ -336,3 +336,121 @@ flask<3.0.0
 · Запятые внутри версий (например, >=2.0.0,<3.0.0) допустимы
 · Пробелы не должны быть вокруг запятых между пакетами
 · Конечная запятая недопустима
+
+
+Понял проблему: devpi не может правильно распарсить все constraints одной строкой через запятую, особенно если есть пробелы или сложные версии. Решение — добавлять constraints по одному с помощью оператора constraints+=.
+
+Вот модифицированный скрипт:
+
+```bash
+#!/bin/bash
+set -e
+
+# Функция ожидания готовности Devpi
+wait_for_devpi() {
+    echo "Waiting for devpi server..."
+    for i in {1..30}; do
+        if devpi use http://localhost:3141 >/dev/null 2>&1; then
+            echo "Devpi is ready."
+            return 0
+        fi
+        sleep 1
+    done
+    echo "Error: Devpi server not available after 30 seconds."
+    exit 1
+}
+
+wait_for_devpi
+
+# Настройка аутентификации root
+ROOT_PASSWORD="${DEVPISERVER_ROOT_PASSWORD:-admin123}"
+
+if ! devpi login root --password="$ROOT_PASSWORD" 2>/dev/null; then
+    if devpi login root --password='' 2>/dev/null; then
+        echo "Setting root password..."
+        devpi user -m root password="$ROOT_PASSWORD"
+        devpi login root --password="$ROOT_PASSWORD"
+    else
+        echo "Error: Cannot authenticate as root. Check credentials."
+        exit 1
+    fi
+fi
+
+# Создание зеркала PyPI (если отсутствует)
+if ! devpi index root/pypi >/dev/null 2>&1; then
+    devpi index -c pypi type=mirror mirror_url="https://pypi.org/simple/"
+fi
+
+# Создание индексов для проектов
+PROJECTS_DIR="/docker-entrypoint-init.d/projects"
+if [ -d "$PROJECTS_DIR" ]; then
+    for project_dir in "$PROJECTS_DIR"/*/; do
+        [ -d "$project_dir" ] || continue
+        project_name=$(basename "$project_dir")
+        index_name="root/${project_name}"
+
+        # Создаём индекс, если не существует
+        if ! devpi index "$index_name" >/dev/null 2>&1; then
+            devpi index -c "$project_name" type=constrained bases=root/pypi volatile=False
+        fi
+
+        constraints_file="${project_dir}constraints.txt"
+        if [ -f "$constraints_file" ] && [ -s "$constraints_file" ]; then
+            echo "Applying constraints for $project_name..."
+
+            # Читаем файл построчно и добавляем constraints
+            while IFS= read -r line || [ -n "$line" ]; do
+                # Удаляем пробелы в начале и конце
+                line=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                
+                # Пропускаем пустые строки и комментарии
+                if [ -z "$line" ] || [[ "$line" =~ ^# ]]; then
+                    continue
+                fi
+                
+                # Проверяем наличие оператора сравнения (базовая валидация)
+                if [[ "$line" =~ [=<>!] ]]; then
+                    echo "  Adding constraint: $line"
+                    devpi index "$index_name" constraints+="$line"
+                else
+                    echo "  Warning: skipping invalid line: $line (no comparison operator)"
+                fi
+            done < "$constraints_file"
+            
+            echo "Finished adding constraints for $project_name."
+        else
+            echo "No non-empty constraints.txt for $project_name, skipping."
+        fi
+    done
+fi
+
+echo "All project indexes configured."
+```
+
+Преимущества такого подхода
+
+1. Избегает ошибки парсинга – каждая строка обрабатывается отдельно.
+2. Прозрачность – видно, какое именно constraint добавилось, и если какая-то строка вызывает ошибку 400, она будет сразу видна (и скрипт остановится из-за set -e, но можно добавить обработку).
+3. Гибкость – можно добавлять constraints в несколько этапов без перезаписи существующих.
+4. Поддержка комментариев и пустых строк – они игнорируются.
+
+Примечание по производительности
+
+Если constraints.txt содержит тысячи строк, поочерёдный вызов devpi index может быть медленным. В этом случае можно вернуться к batch-методу, но тогда нужно тщательно очистить файл от лишних пробелов и комментариев, а также убедиться, что в строках нет внутренних запятых (кроме разделителей версий). Для большинства проектов с десятками constraints пошаговое добавление вполне приемлемо.
+
+Если всё же хотите batch-метод с безопасным форматированием
+
+Вот альтернативная функция, которая корректно преобразует constraints.txt в строку, принимаемую Devpi:
+
+```bash
+format_constraints_batch() {
+    grep -v '^[[:space:]]*#' "$1" | \
+    grep -v '^[[:space:]]*$' | \
+    sed 's/[[:space:]]*$//' | \
+    tr '\n' ',' | \
+    sed 's/,$//' | \
+    sed 's/,/, /g'   # devpi может требовать пробел после запятой
+}
+```
+
+Но по опыту, пошаговое добавление – самый надёжный способ избежать ошибки 400.

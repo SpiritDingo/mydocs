@@ -309,3 +309,150 @@ sudo httpd -M | grep -E "cgi|proxy_fcgi|proxy_scgi"
 После включения CGIPassAuth On будет работать именно с теми модулями, через которые идёт обработка запроса (чаще всего proxy_fcgi).
 
 Если планируете использовать .htaccess для CGIPassAuth, убедитесь, что в конфигурации виртуального хоста разрешено AllowOverride AuthConfig.
+
+_________
+
+
+Для Oracle Linux 9 (сборка на базе RHEL 9) Apache поставляется как httpd, а PHP-FPM — отдельный сервис. Ниже приведена конкретная последовательность настройки, которая позволит PHP‑приложению получать HTTP‑заголовок Authorization и использовать его для привязки к LDAP‑серверу по LDAPS.
+
+---
+
+1. Установка необходимых пакетов
+
+```bash
+dnf install -y httpd php-fpm php-ldap
+```
+
+Если планируете использовать LDAPS, также потребуется CA‑сертификат вашего LDAP‑сервера в системном хранилище.
+
+---
+
+2. Активация модулей Apache
+
+Для PHP‑FPM нужны mod_proxy и mod_proxy_fcgi. Модули mod_cgi / mod_cgid при использовании PHP‑FPM не требуются, но если они явно запрошены, их можно включить (обычно они уже присутствуют).
+
+Файл конфигурации модулей: /etc/httpd/conf.modules.d/00-proxy.conf. Добавьте или раскомментируйте строки:
+
+```apache
+LoadModule proxy_module modules/mod_proxy.so
+LoadModule proxy_fcgi_module modules/mod_proxy_fcgi.so
+```
+
+Перезапускать Apache пока рано — сделаем это после правки основного конфига.
+
+---
+
+3. Настройка PHP‑FPM
+
+Убедитесь, что PHP‑FPM слушает Unix‑сокет (по умолчанию в Oracle Linux 9 это /run/php-fpm/www.sock).
+Файл /etc/php-fpm.d/www.conf должен содержать:
+
+```ini
+listen = /run/php-fpm/www.sock
+listen.owner = apache
+listen.group = apache
+listen.mode = 0660
+```
+
+Запустите и включите PHP‑FPM:
+
+```bash
+systemctl enable --now php-fpm
+```
+
+---
+
+4. Конфигурация виртуального хоста с CGIPassAuth On
+
+Создайте файл /etc/httpd/conf.d/ldap-app.conf:
+
+```apache
+<VirtualHost *:443>
+    ServerName ldap-auth.example.com
+    DocumentRoot /var/www/html/ldap-app/public
+
+    # SSL для безопасной передачи учётных данных клиент -> веб-сервер
+    SSLEngine on
+    SSLCertificateFile      /etc/pki/tls/certs/server.crt
+    SSLCertificateKeyFile   /etc/pki/tls/private/server.key
+
+    <Directory /var/www/html/ldap-app/public>
+        Require all granted
+        AllowOverride None
+
+        # Передаём HTTP-заголовок Authorization в PHP-FPM
+        CGIPassAuth On
+
+        # Для тестового окружения можно ослабить проверку сертификата LDAP
+        # В продакшене указывайте корректный CA-файл через ldap_set_option()
+        SetEnv LDAPTLS_REQCERT never
+    </Directory>
+
+    # Проксирование PHP-файлов в PHP-FPM
+    <FilesMatch "\.php$">
+        SetHandler "proxy:unix:/run/php-fpm/www.sock|fcgi://localhost"
+    </FilesMatch>
+</VirtualHost>
+```
+
+Пояснение ключевых моментов:
+
+· CGIPassAuth On — именно эта директива гарантирует, что заголовок Authorization станет доступен в $_SERVER['HTTP_AUTHORIZATION'].
+· SetHandler для .php отправляет запросы в PHP‑FPM через FastCGI.
+· SetEnv LDAPTLS_REQCERT never — только для отладки! В рабочей среде лучше указать SetEnv LDAPTLS_CACERT /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem и не снижать требования проверки.
+
+---
+
+5. Применение изменений
+
+```bash
+systemctl enable --now httpd
+systemctl restart httpd
+```
+
+Если SELinux включён (по умолчанию в OL9 — Enforcing), разрешите Apache подключаться к сокету PHP‑FPM и сети LDAPS:
+
+```bash
+setsebool -P httpd_can_network_connect on
+semanage fcontext -a -t httpd_var_run_t "/run/php-fpm(/.*)?"
+restorecon -Rv /run/php-fpm
+```
+
+Порт LDAPS (636) должен быть открыт в файрволе, если LDAP‑сервер находится за пределами локальной машины:
+
+```bash
+firewall-cmd --permanent --add-port=636/tcp
+firewall-cmd --reload
+```
+
+---
+
+6. Проверка работы
+
+Создайте простой PHP‑скрипт, например /var/www/html/ldap-app/public/test.php:
+
+```php
+<?php
+header('Content-Type: text/plain');
+echo 'HTTP_AUTHORIZATION: ' . ($_SERVER['HTTP_AUTHORIZATION'] ?? 'NOT SET') . "\n";
+```
+
+Выполните тестовый запрос с заголовком Authorization:
+
+```bash
+curl -k -H "Authorization: Basic dGVzdDpzZWNyZXQ=" https://ldap-auth.example.com/test.php
+```
+
+Ожидаемый ответ:
+
+```
+HTTP_AUTHORIZATION: Basic dGVzdDpzZWNyZXQ=
+```
+
+Если вы видите NOT SET, проверьте, что CGIPassAuth On находится в корректном контексте <Directory> и что AllowOverride не затирает настройки (в примере он выключен).
+
+После успешной проверки можно реализовать аутентификацию через ldap_bind(), извлекая $user и $pass из $_SERVER['HTTP_AUTHORIZATION'].
+
+---
+
+Таким образом, ключевым элементом является именно директива CGIPassAuth On — без неё заголовок Authorization будет отброшен Apache, и PHP‑LDAP не получит учётные данные. Остальная конфигурация стандартна для связки httpd + PHP‑FPM на Oracle Linux 9.

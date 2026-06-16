@@ -190,3 +190,122 @@ sudo apache2ctl configtest && sudo systemctl reload apache2
 ```
 
 Если остались вопросы — уточните, какой именно LDAP (OpenLDAP, Active Directory) и будем настраивать дальше.
+
+
+________
+
+
+Ниже — пошаговые инструкции для установки и включения перечисленных модулей в наиболее распространённых дистрибутивах Linux. В большинстве случаев они уже есть в стандартной поставке Apache, и требуется только их активировать.
+
+---
+
+Debian / Ubuntu (Apache именуется apache2)
+
+1. Установка Apache (если ещё не установлен)
+
+```bash
+sudo apt update
+sudo apt install apache2
+```
+
+Все нужные модули уже содержатся в пакете apache2-bin. Отдельно ничего доустанавливать не требуется.
+
+2. Включение модулей
+
+```bash
+# mod_cgi (для prefork MPM) и mod_cgid (для worker/event MPM)
+sudo a2enmod cgi
+sudo a2enmod cgid
+
+# mod_proxy и его подмодули
+sudo a2enmod proxy
+sudo a2enmod proxy_fcgi
+sudo a2enmod proxy_scgi
+```
+
+Утилита a2enmod создаёт символические ссылки из /etc/apache2/mods-available/ в /etc/apache2/mods-enabled/.
+
+3. Перезапуск Apache
+
+```bash
+sudo systemctl restart apache2
+```
+
+4. Проверка
+
+```bash
+sudo apachectl -M | grep -E "cgi|proxy_fcgi|proxy_scgi"
+```
+
+Вы должны увидеть строки, подтверждающие загрузку модулей.
+
+---
+
+RHEL / CentOS / AlmaLinux / Rocky Linux (Apache именуется httpd)
+
+1. Установка Apache (если необходимо)
+
+В RHEL 7 понадобится пакет из стандартных репозиториев; для RHEL 8/9 модули идут в составе httpd.
+Для CentOS 7:
+
+```bash
+sudo yum install httpd
+```
+
+Для RHEL 8/9 и производных:
+
+```bash
+sudo dnf install httpd
+```
+
+Все перечисленные модули уже скомпилированы и находятся в /etc/httpd/modules/. Остаётся только прописать их загрузку.
+
+2. Включение модулей через файлы конфигурации
+
+Отредактируйте (или создайте) файл /etc/httpd/conf.modules.d/00-proxy.conf и добавьте/раскомментируйте строки:
+
+```apache
+LoadModule proxy_module modules/mod_proxy.so
+LoadModule proxy_fcgi_module modules/mod_proxy_fcgi.so
+LoadModule proxy_scgi_module modules/mod_proxy_scgi.so
+```
+
+Для mod_cgi и mod_cgid откройте /etc/httpd/conf.modules.d/00-mpm.conf (или создайте отдельный файл, например /etc/httpd/conf.modules.d/01-cgi.conf) и добавьте:
+
+```apache
+LoadModule cgi_module modules/mod_cgi.so
+LoadModule cgid_module modules/mod_cgid.so
+```
+
+Примечание: cgi_module и cgid_module конфликтуют друг с другом. Обычно включают один из них в зависимости от используемого MPM:
+
+· cgi_module — для prefork MPM,
+· cgid_module — для worker или event MPM.
+
+Можно прописать оба: Apache загрузит только совместимый с текущим MPM и проигнорирует второй, выдав предупреждение. Чтобы избежать предупреждений, лучше указать только нужный.
+
+3. Перезапуск Apache
+
+```bash
+sudo systemctl restart httpd
+```
+
+4. Проверка
+
+```bash
+sudo httpd -M | grep -E "cgi|proxy_fcgi|proxy_scgi"
+```
+
+---
+
+Что делать, если модуль не обнаружен (редкие случаи)
+
+· Debian/Ubuntu: пакет apache2-bin должен быть установлен. Если модуля почему-то нет, переустановите его:
+    sudo apt install --reinstall apache2-bin
+· RHEL/CentOS 7: модули proxy_fcgi и proxy_scgi присутствуют в штатном httpd-2.4.6. Если отсутствуют, обновите пакет:
+    sudo yum reinstall httpd
+· RHEL 8/9: модули в составе httpd-core (зависимость от httpd). Переустановка не требуется.
+
+После включения CGIPassAuth On будет работать именно с теми модулями, через которые идёт обработка запроса (чаще всего proxy_fcgi).
+
+Если планируете использовать .htaccess для CGIPassAuth, убедитесь, что в конфигурации виртуального хоста разрешено AllowOverride AuthConfig.

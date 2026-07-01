@@ -499,3 +499,287 @@ lint → plan (dry-run) → apply (manual, per group)
 
 Применяйте комбинацию этих вариантов в зависимости от сложности проекта. Каждый из них реализуем без отказа от Ansible, используя GitLab CI как оркестратор, а Ansible — как движок конфигурации.
 
+
+--------
+
+
+
+Раз вы работаете без Docker, GitLab Runner у вас использует shell executor на том же сервере, где стоит Ansible. Это накладывает свои особенности, но открывает и дополнительные возможности. Вот ещё больше вариантов организации пайплайна, адаптированных под такой «bare-metal» раннер.
+
+---
+
+1. Подготовка окружения: виртуальное окружение и зависимости
+
+Shell executor не даёт чистого контейнера, поэтому первым делом надо позаботиться о воспроизводимости. Рекомендую использовать Python venv и зафиксировать версии.
+
+```yaml
+variables:
+  ANSIBLE_VENV: $CI_PROJECT_DIR/.venv
+
+stages:
+  - setup
+  - prepare
+  - install
+  - configure
+  - restart
+
+setup:
+  stage: setup
+  script:
+    - python3 -m venv $ANSIBLE_VENV
+    - source $ANSIBLE_VENV/bin/activate
+    - pip install ansible==9.2.0 ansible-lint
+    - ansible-galaxy collection install -r requirements.yml
+    - ansible-galaxy role install -r requirements.yml
+  cache:
+    key: ansible-deps
+    paths:
+      - .venv/
+      - ~/.ansible/
+```
+
+Этот этап создаёт изолированное окружение и кеширует его между пайплайнами. В последующих job‑ах просто активируем venv.
+
+---
+
+2. Классический пайплайн с тегами (на shell executor)
+
+Прямолинейный подход из первого ответа прекрасно работает. Отличие только в том, что мы не указываем image и вручную активируем venv.
+
+```yaml
+.ansible_job:
+  before_script:
+    - source $ANSIBLE_VENV/bin/activate
+  script:
+    - ansible-playbook -i inventory playbook.yml --tags $ANSIBLE_TAGS
+
+prepare:
+  extends: .ansible_job
+  stage: prepare
+  variables:
+    ANSIBLE_TAGS: prepare
+
+install:
+  extends: .ansible_job
+  stage: install
+  variables:
+    ANSIBLE_TAGS: install
+  needs: ["prepare"]
+...
+```
+
+Можно пойти дальше и вынести команду в Makefile:
+
+```makefile
+# Makefile
+.PHONY: prepare install configure restart
+
+prepare:
+	ansible-playbook -i inventory playbook.yml --tags prepare
+
+install:
+	ansible-playbook -i inventory playbook.yml --tags install
+
+configure:
+	ansible-playbook -i inventory playbook.yml --tags configure
+
+restart:
+	ansible-playbook -i inventory playbook.yml --tags restart
+```
+
+Тогда в .gitlab-ci.yml каждая джоба будет просто вызывать make <stage>.
+
+---
+
+3. Изоляция между джобами и параллельный запуск
+
+По умолчанию shell executor работает в единой рабочей директории ($CI_PROJECT_DIR), и GIT_STRATEGY: fetch может оставлять артефакты с прошлых запусков. Для чистоты можно использовать:
+
+· GIT_STRATEGY: clone для каждой джобы – полный клон с нуля (медленнее, но надёжнее).
+· Либо явно чистить следы в before_script/after_script (например, удалять временные файлы Ansible).
+· Для параллельных джоб по матрице хостов важно, чтобы каждая работала в своей поддиректории. GitLab позволяет задать custom build directory:
+
+```yaml
+deploy_to_host:
+  stage: deploy
+  variables:
+    GIT_STRATEGY: clone
+  parallel:
+    matrix:
+      - HOST: [web01, web02, db01]
+  script:
+    - source $CI_PROJECT_DIR/.venv/bin/activate
+    - ansible-playbook -i inventory playbook.yml --limit $HOST
+  # Каждая job получит уникальный временный каталог автоматически (если concurrent = N)
+```
+
+Если у раннера concurrent = N, то N джоб будут выполняться параллельно, каждая в своей временной папке. Проверьте настройки /etc/gitlab-runner/config.toml.
+
+---
+
+4. Артефакты и передача файлов между стадиями
+
+Без Docker артефакты работают точно так же: GitLab сохраняет указанные файлы в своём внутреннем хранилище и восстанавливает на следующей стадии. Это отлично подходит для передачи сгенерированных конфигов или инвентаря.
+
+```yaml
+build_config:
+  stage: build
+  script:
+    - source .venv/bin/activate
+    - ansible-playbook -i inventory playbook.yml --tags build_config
+  artifacts:
+    paths:
+      - generated_configs/
+    expire_in: 1 hour
+
+deploy_config:
+  stage: deploy
+  needs: [build_config]
+  script:
+    - source .venv/bin/activate
+    - ansible-playbook -i inventory playbook.yml --tags deploy_config -e "config_dir=generated_configs"
+```
+
+---
+
+5. Динамический инвентарь и использование нескольких окружений
+
+Если инвентарь лежит рядом (например, inventory/dev, inventory/prod), можно запускать стадии для разных окружений с rules по веткам или переменным.
+
+```yaml
+.ansible_env:
+  before_script:
+    - source .venv/bin/activate
+  script:
+    - ansible-playbook -i inventories/$ENV playbook.yml --tags $ANSIBLE_TAGS
+
+deploy_dev:
+  extends: .ansible_env
+  stage: deploy
+  variables:
+    ENV: dev
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+  environment:
+    name: development
+
+deploy_prod:
+  extends: .ansible_env
+  stage: deploy
+  variables:
+    ENV: prod
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  when: manual
+  environment:
+    name: production
+```
+
+При этом секреты для prod можно подложить через GitLab Variables с разным окружением.
+
+---
+
+6. Дочерние пайплайны с триггерами (всё ещё shell executor)
+
+Вы можете вынести шаблон пайплайна для окружения в отдельный файл и вызывать его через trigger. Это изолирует логику, но запускаться триггерный пайплайн будет на том же (или другом) раннере. Для shell executor ограничений нет, дочерний пайплайн так же получит шелл.
+
+Родительский:
+
+```yaml
+staging:
+  stage: deploy
+  trigger:
+    include: .gitlab/ci/staging.yml
+    strategy: depend
+  variables:
+    ENV: staging
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+```
+
+В .gitlab/ci/staging.yml определите все стадии (prepare, install и т.д.), наследующие базовые настройки из родительского проекта (через include).
+
+---
+
+7. Использование Ansible Runner (более нативный запуск)
+
+Вместо прямого вызова ansible-playbook можно установить ansible-runner и запускать плейбуки через него. Это даёт структурированные артефакты (JSON-логи) и удобную интеграцию.
+
+```yaml
+run_playbook:
+  stage: deploy
+  before_script:
+    - source .venv/bin/activate
+  script:
+    - ansible-runner run . -p playbook.yml --inventory inventory --tags install
+  artifacts:
+    paths:
+      - artifacts/  # ansible-runner сохраняет результат сюда
+    when: always
+```
+
+---
+
+8. Откат изменений с хранением бэкапов на хосте
+
+На shell executor у вас прямой доступ к файловой системе сервера, поэтому можно организовать хранение бэкапов прямо там (вне рабочей директории CI, чтобы переживали очистку).
+
+```yaml
+rollback:
+  stage: rollback
+  when: manual
+  script:
+    - source .venv/bin/activate
+    - ansible-playbook -i inventory playbook.yml --tags rollback -e "backup_dir=/var/backups/ansible"
+  only:
+    - main
+```
+
+---
+
+9. Полный контроль с динамической генерацией пайплайна из инвентаря
+
+Сценарий: у вас один раннер, но десятки групп хостов. Можно в явном виде не прописывать каждую группу, а сгенерировать дочерний пайплайн прямо во время выполнения родительского.
+
+Этап 1 – генерация конфига:
+
+```yaml
+generate_matrix:
+  stage: .pre
+  script:
+    - source .venv/bin/activate
+    # Получить все дочерние группы инвентаря
+    - ansible-inventory -i inventory --list | jq -c '.all.children' > groups.json
+    # Сгенерировать файл pipeline.yml с матрицей
+    - python3 generate_pipeline.py > dynamic-pipeline.yml
+  artifacts:
+    paths:
+      - dynamic-pipeline.yml
+```
+
+Этап 2 – запуск сгенерированного пайплайна:
+
+```yaml
+child_pipeline:
+  stage: deploy
+  trigger:
+    include:
+      - artifact: dynamic-pipeline.yml
+        job: generate_matrix
+    strategy: depend
+```
+
+Внутри generate_pipeline.py можно создать нужные джобы на каждую группу. При этом всё выполняется на одном shell раннере, если он сконфигурирован с concurrent > 1.
+
+---
+
+10. Советы по оптимизации именно для shell executor
+
+· Кеширование коллекций: Укажите ANSIBLE_COLLECTIONS_PATHS=~/.ansible/collections и добавьте путь в cache, чтобы не скачивать их каждый раз.
+· Файл блокировки: Так как джобы могут выполняться параллельно, избегайте гонки за общими ресурсами. Например, ansible-galaxy install лучше выполнять в рамках setup и затем не трогать. Используйте flock для критических секций.
+· Очистка: Добавьте в after_script удаление временных файлов Ansible (например, retry файлов). Сама GitLab чистит рабочую директорию только при следующем пайплайне, если используется GIT_STRATEGY: fetch.
+· Безопасность: Поскольку раннер на голом железе, не храните секреты в коде. Используйте GitLab CI Variables, защищённые ветки и, если нужно, ansible-vault с паролем, переданным через переменную.
+
+---
+
+Таким образом, даже без Docker вы можете построить гибкий, параллельный и полностью контролируемый пайплайн для Ansible на shell executor. Используйте виртуальное окружение, кеши, артефакты и матрицы — все эти фичи GitLab CI работают и на голом железе. Если понадобится конкретный пример генератора пайплайна или Makefile под вашу структуру ролей — пишите, дополню.

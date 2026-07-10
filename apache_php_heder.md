@@ -382,3 +382,141 @@ var_dump(isset($_SERVER['PHP_AUTH_PW'])); // Должно быть false пос�
 ```
 
 Если возвращается false — пароль скрыт.
+
+
+
+
+
+Вот пример «правильной» конфигурации Apache 2.4 с фильтрацией HTTP-заголовков (и запросов, и ответов) в связке с PHP-FPM. В неё включены:
+
+· базовая настройка проксирования на FPM,
+· удаление лишних заголовков ответа (X-Powered-By, Server и т.п.),
+· добавление обязательных security-заголовков,
+· фильтрация входящих заголовков перед отправкой в бэкенд,
+· корректная обработка CORS,
+· а также скрытие переменной PHP_AUTH_PW, если вдруг используется mod_php.
+
+```apache
+<VirtualHost *:80>
+    ServerName example.com
+    ServerAdmin webmaster@example.com
+    DocumentRoot /var/www/html
+
+    # ---------- 1. PHP-FPM через mod_proxy_fcgi ----------
+    <FilesMatch \.php$>
+        SetHandler "proxy:unix:/run/php/php8.2-fpm.sock|fcgi://localhost/"
+    </FilesMatch>
+
+    # При использовании FPM переменные PHP_AUTH_PW и PHP_AUTH_USER
+    # по умолчанию отсутствуют – это уже скрыто.
+    # Если же у вас mod_php, раскомментируйте строки ниже:
+    # <IfModule mod_env.c>
+    #     UnsetEnv PHP_AUTH_PW
+    #     UnsetEnv PHP_AUTH_USER
+    #     UnsetEnv AUTH_TYPE
+    # </IfModule>
+
+    # ---------- 2. Фильтрация ответных заголовков (Response Headers) ----------
+    # Убираем ненужные «технические» заголовки
+    Header always unset X-Powered-By
+    Header always unset Server
+    Header always unset X-Generator
+
+    # Добавляем современные security-заголовки
+    Header always set Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set X-Frame-Options "DENY"
+    Header always set X-XSS-Protection "1; mode=block"
+    Header always set Referrer-Policy "strict-origin-when-cross-origin"
+
+    # Content-Security-Policy – настройте под своё приложение
+    Header always set Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'"
+
+    # Разрешения (Permissions-Policy) – пример ограничения возможностей браузера
+    Header always set Permissions-Policy "camera=(), microphone=(), geolocation=()"
+
+    # ---------- 3. Фильтрация входящих заголовков (Request Headers) ----------
+    # Передаём реальный IP клиента, если Apache стоит за прокси
+    # (Раскомментируйте при необходимости)
+    # RequestHeader set X-Real-IP "%{REMOTE_ADDR}s"
+    # RequestHeader set X-Forwarded-For "%{REMOTE_ADDR}s"
+
+    # Удаляем потенциально опасные или неиспользуемые заголовки из запроса
+    RequestHeader unset X-Http-Method-Override
+    RequestHeader unset X-Requested-With
+    RequestHeader unset Proxy
+    # Ограничиваем размер строки запроса и полей заголовков (глобально лучше в server-wide контексте)
+    LimitRequestFieldSize 8190
+    LimitRequestLine 8190
+
+    # ---------- 4. CORS (если требуется) ----------
+    <IfModule mod_headers.c>
+        Header always set Access-Control-Allow-Origin "*"
+        Header always set Access-Control-Allow-Methods "GET, POST, OPTIONS, PUT, DELETE"
+        Header always set Access-Control-Allow-Headers "Authorization, Content-Type, X-Requested-With"
+        Header always set Access-Control-Max-Age "86400"
+    </IfModule>
+
+    # Обработка preflight-запросов OPTIONS
+    RewriteEngine On
+    RewriteCond %{REQUEST_METHOD} OPTIONS
+    RewriteRule ^(.*)$ $1 [R=204,L]
+
+    # ---------- 5. Условные заголовки для статики ----------
+    # Сильное кеширование для неизменяемых ресурсов (версионированные файлы)
+    <FilesMatch "\.(ico|pdf|flv|jpg|jpeg|png|gif|js|css|swf|webp|woff2)$">
+        Header set Cache-Control "max-age=31536000, public, immutable"
+    </FilesMatch>
+
+    # Отключаем кеширование для HTML и PHP
+    <FilesMatch "\.(html|php)$">
+        Header set Cache-Control "no-cache, no-store, must-revalidate"
+        Header set Pragma "no-cache"
+        Header set Expires 0
+    </FilesMatch>
+
+    # ---------- 6. Защита директории ----------
+    <Directory /var/www/html>
+        Options -Indexes +FollowSymLinks
+        AllowOverride All
+        Require all granted
+    </Directory>
+
+    # Логирование (по желанию – добавить заголовки в лог)
+    LogFormat "%h %l %u %t \"%r\" %>s %b \"%{Referer}i\" \"%{User-Agent}i\"" combined
+    CustomLog /var/log/apache2/example.com-access.log combined
+    ErrorLog /var/log/apache2/example.com-error.log
+</VirtualHost>
+```
+
+---
+
+Пояснение ключевых моментов
+
+1. PHP_AUTH_PW скрыт
+      В режиме PHP-FPM эта переменная отсутствует изначально. Если вы по какой-то причине всё ещё используете mod_php, директива UnsetEnv полностью убирает её из окружения PHP.
+2. Фильтрация ответных заголовков
+      Header always unset – убирает заголовки всегда (даже для ошибочных ответов).
+      Header always set – гарантирует добавление важных security-заголовков при любом HTTP-статусе.
+3. Фильтрация входящих заголовков
+      RequestHeader unset – удаляет подозрительные или неиспользуемые поля до того, как запрос попадёт в PHP.
+4. CORS
+      Настроен с Access-Control-Allow-Origin "*" – для публичного API. В production лучше указать конкретный домен. Preflight-запросы (OPTIONS) обрабатываются сразу, не доходя до бэкенда, что экономит ресурсы.
+5. Кеширование
+      Правила для статики и динамики разделены через <FilesMatch>, чтобы браузеры и CDN работали эффективнее.
+
+---
+
+Проверка фильтров
+
+После применения конфигурации выполните:
+
+```bash
+apachectl -t          # проверка синтаксиса
+systemctl reload apache2
+curl -I http://example.com/
+```
+
+Убедитесь, что в ответе нет X-Powered-By, есть Strict-Transport-Security и другие security-заголовки, а Cache-Control зависит от типа файла.
+
+Этот шаблон можно дорабатывать под конкретное приложение, но он уже содержит базовый «правильный» набор фильтров, который закрывает большинство рекомендаций OWASP и практик безопасной веб-разработки.

@@ -242,3 +242,194 @@ curl --request POST \
 · Если файл с опциями меняется редко, можно обновлять переменную вручную через UI, но автоматизация экономит время.
 
 Таким образом, хотя прямой загрузки из файла нет, вы можете легко синхронизировать выпадающий список с содержимым файла, используя scheduled pipeline и GitLab API.
+
+_____
+_____
+
+
+В GitLab CI/CD невозможно напрямую загрузить значения для выпадающего списка (select) из внешнего источника, например из Ansible inventory, расположенного в другом проекте. Но вы можете автоматизировать обновление переменной типа select через GitLab API, используя scheduled pipeline, который будет:
+
+1. Получать inventory из нужных проектов.
+2. Извлекать из него списки хостов, групп, переменных и т.д.
+3. Обновлять переменную (или несколько переменных) с типом Select, чтобы при следующем ручном запуске пайплайна в выпадающем списке были актуальные значения.
+
+Ниже — подробная инструкция, как это реализовать.
+
+---
+
+1. Создайте переменную типа Select в настройках проекта
+
+Перейдите в Settings → CI/CD → Variables и добавьте переменную, например:
+
+· Key: ANSIBLE_HOST
+· Value: (значение по умолчанию, например, all)
+· Type: Select
+· Options: (пока можно указать одно значение-заглушку, позже обновится)
+
+Сохраните переменную.
+
+Если нужно несколько выпадающих списков (например, для выбора группы и хоста), создайте несколько переменных.
+
+---
+
+2. Подготовьте скрипт для обновления переменной
+
+В вашем репозитории создайте, например, файл update_ansible_options.sh или встройте команды прямо в джобу .gitlab-ci.yml. Мы рассмотрим вариант с использованием Docker-образа, содержащего ansible, jq, curl и git.
+
+Пример джобы в .gitlab-ci.yml:
+
+```yaml
+stages:
+  - update-options
+
+update_ansible_hosts:
+  stage: update-options
+  image: alpine:latest   # или специализированный образ с ansible
+  before_script:
+    - apk add --no-cache git ansible jq curl
+  script:
+    # 1. Клонируем репозитории с inventory (если они в отдельных проектах)
+    - git clone https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.example.com/group/ansible-inventory.git inventory
+    # Если inventory в том же проекте, можно использовать $CI_PROJECT_DIR
+
+    # 2. Генерируем JSON из inventory
+    - ansible-inventory -i inventory/hosts --list > inventory.json
+
+    # 3. Извлекаем список хостов (например, все хосты)
+    - HOSTS=$(jq -c '[.all.hosts[]] | map(select(. != "localhost"))' inventory.json)
+      # или из групп: jq -c '[._meta.hostvars | keys[]]'
+
+    # 4. Обновляем переменную через API
+    - |
+      PAYLOAD=$(jq -n \
+        --arg value "all" \
+        --argjson options "$HOSTS" \
+        '{value: $value, options: $options}')
+
+      curl --request PUT \
+        --header "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+        --header "Content-Type: application/json" \
+        --data "$PAYLOAD" \
+        "https://gitlab.example.com/api/v4/projects/$CI_PROJECT_ID/variables/ANSIBLE_HOST"
+  only:
+    - schedules   # или можно запускать вручную при необходимости
+```
+
+Пояснения:
+
+· ansible-inventory --list выводит полную структуру в JSON. Вы можете выбрать нужные данные:
+  · Все хосты: .all.hosts (список) или ._meta.hostvars (ключи).
+  · Список групп: .all.children или ключи верхнего уровня, кроме _meta и all.
+  · Переменные группы: .group_name.vars.
+· jq используется для преобразования в JSON-массив строк, который ожидает API.
+· Для клонирования других проектов используется CI_JOB_TOKEN, который имеет доступ только к проектам в той же группе/подгруппе. Если нужно больше прав, используйте персональный токен или project access token.
+· $GITLAB_API_TOKEN — переменная CI/CD (masked, protected) с токеном, имеющим права api на этот проект.
+
+---
+
+3. Настройка доступа к другим проектам
+
+Если inventory хранится в другом проекте, убедитесь, что у джобы есть права на его чтение:
+
+· Если проекты в одной группе, CI_JOB_TOKEN обычно достаточно (если не запрещено настройками).
+· В противном случае создайте Project Access Token (Settings → Access Tokens) в том проекте, где лежит inventory, с правами read_repository. Сохраните его в переменной INVENTORY_READ_TOKEN и используйте при клонировании:
+  ```bash
+  git clone https://oauth2:${INVENTORY_READ_TOKEN}@gitlab.example.com/group/ansible-inventory.git
+  ```
+
+Если inventory находится в том же проекте, просто используйте $CI_PROJECT_DIR без клонирования.
+
+---
+
+4. Запуск по расписанию
+
+Чтобы список всегда был актуальным, настройте CI/CD → Schedules для регулярного запуска джобы (например, раз в час или раз в день). Также можно запускать её вручную через интерфейс (Run pipeline) или при изменении inventory (например, через trigger от другого пайплайна).
+
+---
+
+5. Обработка нескольких выпадающих списков
+
+Если вам нужно несколько связанных списков (например, сначала выбрать группу, потом хост из этой группы), то GitLab не поддерживает каскадные списки на этапе ручного запуска. Возможные обходные пути:
+
+1. Создать один список с комбинированными значениями, например "group:host":
+   ```yaml
+   OPTIONS=$(jq -c '[.all.children | to_entries[] | .key as $g | .value.hosts[]? | "\($g):\(.)"]' inventory.json)
+   ```
+   Пользователь выберет, например, webservers:web01, а в джобе вы разделите значение на группу и хост.
+2. Выполнять выбор в рантайме — передать только имя группы через переменную, а внутри джобы с помощью ansible или jq выбрать конкретный хост (например, через --limit или подстановку). Но тогда не будет выпадающего списка хостов.
+3. Использовать внешний веб-интерфейс (например, собственный сервис), который через API запускает пайплайн с уже выбранными параметрами.
+
+---
+
+6. Пример полного скрипта с извлечением групп, хостов и переменных
+
+Допустим, вы хотите обновить две переменные: ANSIBLE_GROUP (список групп) и ANSIBLE_HOST (список всех хостов). Вот расширенный пример:
+
+```yaml
+update_ansible_options:
+  stage: update-options
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache git ansible jq curl
+  script:
+    - git clone https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.example.com/group/ansible-inventory.git inv
+    - cd inv
+    - ansible-inventory -i hosts --list > inventory.json
+
+    # Группы (все, кроме _meta и all)
+    - GROUPS=$(jq -c '[keys[] | select(. != "_meta" and . != "all")]' inventory.json)
+
+    # Хосты (все хосты из _meta.hostvars)
+    - HOSTS=$(jq -c '[._meta.hostvars | keys[]]' inventory.json)
+
+    # Функция обновления переменной
+    - |
+      update_var() {
+        local var_name=$1
+        local default_value=$2
+        local options=$3
+        local payload=$(jq -n --arg value "$default_value" --argjson options "$options" '{value: $value, options: $options}')
+        curl --request PUT \
+          --header "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+          --header "Content-Type: application/json" \
+          --data "$payload" \
+          "https://gitlab.example.com/api/v4/projects/$CI_PROJECT_ID/variables/$var_name"
+      }
+
+    - update_var "ANSIBLE_GROUP" "all" "$GROUPS"
+    - update_var "ANSIBLE_HOST" "all" "$HOSTS"
+  only:
+    - schedules
+```
+
+---
+
+7. Важные замечания и ограничения
+
+· Безопасность: Переменная $GITLAB_API_TOKEN должна быть защищена (masked, protected) и иметь минимально необходимые права (api только на этот проект). Никогда не храните её в открытом виде в репозитории.
+· Размер списка: GitLab UI может плохо отображать очень большие списки (сотни элементов). Если инвентори содержит много хостов, рассмотрите возможность выбора группы или использование комбинированных значений.
+· Формат inventory: Ansible поддерживает INI, YAML, динамические inventory. ansible-inventory --list работает со всеми, если установлены необходимые плагины (например, для облачных инвентори).
+· Версии: Убедитесь, что в Docker-образе установлены совместимые версии Ansible и jq. Можно использовать официальный образ cytopia/ansible или alpine + пакеты.
+
+---
+
+Альтернативный подход без выпадающего списка
+
+Если автоматизация через API кажется сложной, вы можете передавать нужные параметры через переменные окружения при запуске пайплайна по API (curl) или из другого CI/CD. Тогда не нужен выпадающий список, но пользователь должен сам знать возможные значения.
+
+Пример запуска с параметрами через API:
+
+```bash
+curl -X POST \
+  --header "PRIVATE-TOKEN: $TOKEN" \
+  --form "ref=main" \
+  --form "variables[ANSIBLE_GROUP]=webservers" \
+  --form "variables[ANSIBLE_HOST]=web01" \
+  "https://gitlab.example.com/api/v4/projects/$PROJECT_ID/pipeline"
+```
+
+---
+
+Заключение
+
+Прямая загрузка значений для выпадающего списка из Ansible inventory в .gitlab-ci.yml невозможна, но с помощью scheduled pipeline и GitLab API вы можете автоматически синхронизировать переменные типа Select с данными из любых проектов. Это позволяет при ручном запуске пайплайна выбирать нужные хосты, группы или другие параметры из актуального inventory.

@@ -1021,3 +1021,204 @@ done
 3.  **Логика:** Уточните обработку выхода из цикла `retry` для ошибок, отличных от 127, чтобы гарантированно инкрементировать счетчик `FAILED` после исчерпания попыток.
 
 Эти изменения устранят ошибку "command not found" (127), которая является следствием неправильного парсинга аргументов `sshpass`.
+
+_____
+_____
+_____
+_____
+_____
+
+
+Вот полностью исправленный и готовый к использованию скрипт. 
+
+В него внесены все критические исправления:
+1. **Главное исправление:** Правильное формирование строки для `rsync -e`. Теперь пути и опции корректно передаются через локальный `sh -c`, что полностью исключает ошибку `127 (command not found)`.
+2. **Исправление логики повторов (retry):** Если `rsync` завершился с ошибкой (не 0 и не 127) после всех попыток, каталог теперь гарантированно добавляется в список `FAILED_DIRS` и увеличивает счетчик ошибок (в оригинале при исчерпании попыток счетчик ошибок не рос).
+3. **Безопасность путей:** Путь к файлу пароля внутри команды для `rsync` теперь экранируется двойными кавычками, что спасет от ошибок, если в пути случайно окажутся пробелы.
+
+```bash
+#!/bin/bash
+#
+# rsync_transfer_pass.sh — перенос с авторизацией по паролю
+# Версия: 2.0 (Исправлены ошибки цитирования для rsync -e и логика retry)
+#
+
+# ============ ГАРАНТИРОВАННЫЙ PATH ============
+# Если запускается из cron — PATH может быть урезан.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
+
+# ============ НАСТРОЙКИ ============
+SOURCE_DIRS=(
+    "/data/app1/"
+    "/data/app2/"
+)
+
+REMOTE_USER="backupuser"
+REMOTE_HOST="192.168.1.100"
+REMOTE_PORT="22"
+REMOTE_BASE_DIR="/backup/data"
+
+PASS_FILE="/root/.rsync_pass"
+
+LOG_DIR="/var/log/rsync_transfer"
+LOG_FILE="${LOG_DIR}/rsync_$(date +%Y%m%d_%H%M%S).log"
+
+MAX_RETRIES=3
+SSH_TIMEOUT=30
+
+# ============ ПОДГОТОВКА ============
+mkdir -p "${LOG_DIR}"
+umask 077
+
+log() {
+    local level="$1"; shift
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [${level}] $*" | tee -a "${LOG_FILE}"
+}
+
+# ---- Разрешаем абсолютные пути к бинарникам ----
+SSHPASS_BIN="$(command -v sshpass 2>/dev/null)"
+SSH_BIN="$(command -v ssh 2>/dev/null)"
+RSYNC_BIN="$(command -v rsync 2>/dev/null)"
+
+if [[ -z "${SSH_BIN}" ]]; then
+    log "ERROR" "ssh не найден в PATH. Установите openssh-client."
+    exit 1
+fi
+
+if [[ -z "${RSYNC_BIN}" ]]; then
+    log "ERROR" "rsync не найден в PATH."
+    exit 1
+fi
+
+if [[ -z "${SSHPASS_BIN}" ]]; then
+    log "ERROR" "sshpass не найден. Установите: apt-get install sshpass"
+    log "INFO"  "Пути поиска: ${PATH}"
+    exit 1
+fi
+
+log "INFO" "Используемые бинарники: ssh=${SSH_BIN}, rsync=${RSYNC_BIN}, sshpass=${SSHPASS_BIN}"
+
+# ---- Проверка файла с паролем ----
+if [[ ! -f "${PASS_FILE}" ]]; then
+    log "ERROR" "Файл с паролем не найден: ${PASS_FILE}"
+    exit 1
+fi
+
+PERMS=$(stat -c '%a' "${PASS_FILE}" 2>/dev/null || echo "???")
+if [[ "${PERMS}" != "600" && "${PERMS}" != "400" ]]; then
+    log "WARN" "Права на ${PASS_FILE} = ${PERMS}. Рекомендуется 600 или 400."
+    # Попытка автоматически исправить права, если мы root
+    if [[ $EUID -eq 0 ]]; then
+        chmod 600 "${PASS_FILE}" && log "INFO" "Права на ${PASS_FILE} автоматически изменены на 600."
+    fi
+fi
+
+# ---- Формируем SSH-опции ----
+SSH_OPTS="-p ${REMOTE_PORT} -o ConnectTimeout=${SSH_TIMEOUT} -o StrictHostKeyChecking=accept-new"
+
+# ============ ИСПРАВЛЕНИЕ КРИТИЧЕСКОЙ ОШИБКИ ============
+# Формируем строку для rsync -e. 
+# rsync передает эту строку в локальный shell (sh -c). 
+# Поэтому путь к файлу пароля оборачиваем в экранированные двойные кавычки \"...\", 
+# чтобы защитить от пробелов в пути, а переменные раскрываются на этапе формирования строки.
+RSYNC_RSH_CMD="${SSHPASS_BIN} -f \"${PASS_FILE}\" ${SSH_BIN} ${SSH_OPTS}"
+
+# ============ СТАРТ ============
+log "INFO" "======================================================"
+log "INFO" "Запуск переноса с авторизацией по паролю"
+log "INFO" "Источник: ${SOURCE_DIRS[*]}"
+log "INFO" "Назначение: ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_BASE_DIR}"
+log "INFO" "======================================================"
+
+# Проверка соединения (используем прямые переменные, а не RSYNC_RSH_CMD)
+log "INFO" "Проверка соединения с ${REMOTE_HOST}..."
+if ! "${SSHPASS_BIN}" -f "${PASS_FILE}" "${SSH_BIN}" ${SSH_OPTS} \
+        "${REMOTE_USER}@${REMOTE_HOST}" "echo ok" &>>"${LOG_FILE}"; then
+    log "ERROR" "Не удалось подключиться к ${REMOTE_HOST}. Проверьте пароль и доступность хоста."
+    exit 1
+fi
+log "INFO" "Соединение установлено."
+
+# Создаём базовый каталог
+"${SSHPASS_BIN}" -f "${PASS_FILE}" "${SSH_BIN}" ${SSH_OPTS} \
+    "${REMOTE_USER}@${REMOTE_HOST}" "mkdir -p '${REMOTE_BASE_DIR}'" &>>"${LOG_FILE}" \
+    || { log "ERROR" "Не удалось создать ${REMOTE_BASE_DIR} на удаленном хосте"; exit 1; }
+
+# ============ ПЕРЕНОС ============
+TOTAL=0; SUCCESS=0; FAILED=0
+FAILED_DIRS=()
+
+for SRC in "${SOURCE_DIRS[@]}"; do
+    TOTAL=$((TOTAL + 1))
+
+    if [[ ! -d "${SRC}" ]]; then
+        log "WARN" "Источник не найден, пропуск: ${SRC}"
+        FAILED=$((FAILED + 1))
+        FAILED_DIRS+=("${SRC} (не существует)")
+        continue
+    fi
+
+    DEST="${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_BASE_DIR}/$(basename "${SRC}")"
+    log "INFO" "------------------------------------------------------"
+    log "INFO" "Перенос: ${SRC}  ->  ${DEST}"
+
+    RETRY=0; RC=1
+    while [[ ${RETRY} -lt ${MAX_RETRIES} && ${RC} -ne 0 ]]; do
+        RETRY=$((RETRY + 1))
+        log "INFO" "Попытка ${RETRY}/${MAX_RETRIES}..."
+
+        # Вызов rsync с правильно сформированной строкой для -e
+        "${RSYNC_BIN}" -avz --delete \
+            --numeric-ids \
+            --partial --progress --stats --human-readable \
+            -e "${RSYNC_RSH_CMD}" \
+            "${SRC}" "${DEST}" &>>"${LOG_FILE}"
+        RC=$?
+
+        case ${RC} in
+            0)
+                log "INFO" "Успешно: ${SRC}"
+                SUCCESS=$((SUCCESS + 1))
+                ;;
+            127)
+                log "ERROR" "Код 127: команда не найдена. Проверьте пути к sshpass/ssh."
+                log "ERROR" "Сформированная команда RSH: ${RSYNC_RSH_CMD}"
+                FAILED=$((FAILED + 1))
+                FAILED_DIRS+=("${SRC} (code 127)")
+                RC=0   # Искусственно обнуляем, чтобы выйти из цикла while без повторных попыток
+                break
+                ;;
+            *)
+                log "WARN" "Ошибка rsync (код ${RC}) для ${SRC}"
+                sleep 5
+                ;;
+        esac
+    done
+
+    # ============ ИСПРАВЛЕНИЕ ЛОГИКИ RETRY ============
+    # Если цикл завершился, но RC всё еще не 0 (и это не была обработка 127),
+    # значит исчерпаны все попытки. Гарантированно считаем это как FAILED.
+    if [[ ${RC} -ne 0 ]]; then
+        FAILED=$((FAILED + 1))
+        FAILED_DIRS+=("${SRC} (ошибка после ${MAX_RETRIES} попыток, код ${RC})")
+    fi
+done
+
+# ============ ИТОГИ ============
+log "INFO" "======================================================"
+log "INFO" "ИТОГИ: всего=${TOTAL}, успешно=${SUCCESS}, ошибок=${FAILED}"
+if [[ ${#FAILED_DIRS[@]} -gt 0 ]]; then
+    for D in "${FAILED_DIRS[@]}"; do
+        log "ERROR" "  - Не перенесено: ${D}"
+    done
+fi
+log "INFO" "Лог сохранён: ${LOG_FILE}"
+
+# Возвращаем 0 если всё успешно, иначе 2 (чтобы cron/мониторинг могли перехватить ошибку)
+[[ ${FAILED} -eq 0 ]] && exit 0 || exit 2
+```
+
+### Что было изменено (кратко):
+1. **`RSYNC_RSH_CMD`**: Строка для `-e` теперь формируется как `${SSHPASS_BIN} -f \"${PASS_FILE}\" ${SSH_BIN} ${SSH_OPTS}`. Экранированные кавычки `\"` гарантируют, что когда `rsync` передаст эту команду в `sh -c`, путь к паролю не "развалится" на части, если в нем вдруг появятся пробелы.
+2. **Счетчик ошибок в цикле `while`**: Добавлен блок `if [[ ${RC} -ne 0 ]]; then` после цикла. В оригинальном скрипте, если `rsync` падал с кодом, например, `23` (ошибка частичной передачи) 3 раза подряд, цикл завершался, но переменная `FAILED` не увеличивалась, и скрипт мог ошибочно рапортовать об успехе или просто не включить каталог в итоговый отчет.
+3. **Автоисправление прав**: Если скрипт запущен от `root` и права на файл пароля неверные, он теперь сам выполнит `chmod 600`, а не просто напишет предупреждение (это предотвратит блокировку со стороны `sshpass`, который в новых версиях отказывается работать с "открытыми" файлами паролей).

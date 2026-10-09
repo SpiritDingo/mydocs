@@ -1222,3 +1222,271 @@ log "INFO" "Лог сохранён: ${LOG_FILE}"
 1. **`RSYNC_RSH_CMD`**: Строка для `-e` теперь формируется как `${SSHPASS_BIN} -f \"${PASS_FILE}\" ${SSH_BIN} ${SSH_OPTS}`. Экранированные кавычки `\"` гарантируют, что когда `rsync` передаст эту команду в `sh -c`, путь к паролю не "развалится" на части, если в нем вдруг появятся пробелы.
 2. **Счетчик ошибок в цикле `while`**: Добавлен блок `if [[ ${RC} -ne 0 ]]; then` после цикла. В оригинальном скрипте, если `rsync` падал с кодом, например, `23` (ошибка частичной передачи) 3 раза подряд, цикл завершался, но переменная `FAILED` не увеличивалась, и скрипт мог ошибочно рапортовать об успехе или просто не включить каталог в итоговый отчет.
 3. **Автоисправление прав**: Если скрипт запущен от `root` и права на файл пароля неверные, он теперь сам выполнит `chmod 600`, а не просто напишет предупреждение (это предотвратит блокировку со стороны `sshpass`, который в новых версиях отказывается работать с "открытыми" файлами паролей).
+
+________
+________
+
+# Анализ скриншота и исправление скрипта
+
+## Распознанный вывод скрипта
+
+```
+[2026-10-09 17:17:21] [INFO] Используемые бинарники: ssh=/usr/bin/ssh, rsync=/usr/bin/rsync, sshpass=/...
+[2026-10-09 17:17:21] [INFO] ======================================================
+[2026-10-09 17:17:21] [INFO] Запуск переноса с авторизацией по паролю
+[2026-10-09 17:17:21] [INFO] Источник: /tmp/app01
+[2026-10-09 17:17:21] [INFO] Назначение: srvansible@nn-1cfls-001-p:/tmp/bk_app_all
+[2026-10-09 17:17:21] [INFO] ======================================================
+[2026-10-09 17:17:21] [INFO] Проверка соединения с nn-1cfls-001-p...
+ok
+[2026-10-09 17:17:22] [INFO] Соединение установлено.
+[2026-10-09 17:17:22] [INFO] ------------------------------------------------------
+[2026-10-09 17:17:22] [INFO] Перенос: /tmp/app01  ->  srvansible@nn-1cfls-001-p:/tmp/bk_app_all/app01
+[2026-10-09 17:17:22] [INFO] Попытка 1/3...
+bash: line 1: rsync: command not found
+rsync: connection unexpectedly closed (0 bytes received so far) [sender]
+rsync error: remote command not found (code 127) at io.c(232) [sender=3.2.7]
+[2026-10-09 17:17:23] [ERROR] Код 127: команда не найдена. Проверьте пути к sshpass/ssh.
+[2026-10-09 17:17:23] [ERROR] Сформированная команда RSH: /usr/bin/sshpass -f "/root/.rsync_pass" /usr/bin/ssh...
+[2026-10-09 17:17:23] [INFO] ======================================================
+[2026-10-09 17:17:23] [INFO] ИТОГИ: всего=1, успешно=0, ошибок=1
+[2026-10-09 17:17:23] [ERROR]   - Не перенесено: /tmp/app01 (code 127)
+[2026-10-09 17:17:23] [INFO] Лог сохранён: /var/log/rsync_transfer/rsync_20261009_171721.log
+```
+
+## Диагноз проблемы
+
+**Ключевая строка:** `bash: line 1: rsync: command not found`
+
+Проблема **НЕ в локальном rsync** (он работает, иначе бы не дошло до этой ошибки). Проблема в том, что **rsync не найден на УДАЛЁННОМ хосте** `nn-1cfls-001-p`.
+
+Когда rsync работает по SSH, он:
+1. Запускается локально
+2. Через SSH подключается к удалённому хосту
+3. **Пытается запустить rsync на удалённой стороне**
+4. Если на удалённом хосте rsync не в PATH (или не установлен) → code 127
+
+При использовании `sshpass` + non-interactive shell PATH часто урезан, и даже если rsync установлен в `/usr/bin/rsync`, shell его не находит.
+
+## Исправленный скрипт
+
+```bash
+#!/bin/bash
+#
+# rsync_transfer_pass.sh — перенос с авторизацией по паролю
+# Версия: 3.0 (Исправлена ошибка 127 на удалённом хосте)
+#
+
+# ============ ГАРАНТИРОВАННЫЙ PATH ============
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
+
+# ============ НАСТРОЙКИ ============
+SOURCE_DIRS=(
+    "/tmp/app01"
+)
+
+REMOTE_USER="srvansible"
+REMOTE_HOST="nn-1cfls-001-p"
+REMOTE_PORT="22"
+REMOTE_BASE_DIR="/tmp/bk_app_all"
+
+PASS_FILE="/root/.rsync_pass"
+
+# ВАЖНО: Явный путь к rsync на удалённом хосте
+# Если rsync установлен в нестандартном месте — измените этот путь
+REMOTE_RSYNC_PATH="/usr/bin/rsync"
+
+LOG_DIR="/var/log/rsync_transfer"
+LOG_FILE="${LOG_DIR}/rsync_$(date +%Y%m%d_%H%M%S).log"
+
+MAX_RETRIES=3
+SSH_TIMEOUT=30
+
+# ============ ПОДГОТОВКА ============
+mkdir -p "${LOG_DIR}"
+umask 077
+
+log() {
+    local level="$1"; shift
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [${level}] $*" | tee -a "${LOG_FILE}"
+}
+
+# ---- Поиск бинарников ----
+SSHPASS_BIN="$(command -v sshpass 2>/dev/null)"
+SSH_BIN="$(command -v ssh 2>/dev/null)"
+RSYNC_BIN="$(command -v rsync 2>/dev/null)"
+
+if [[ -z "${SSH_BIN}" ]]; then
+    log "ERROR" "ssh не найден в PATH. Установите openssh-client."
+    exit 1
+fi
+
+if [[ -z "${RSYNC_BIN}" ]]; then
+    log "ERROR" "rsync не найден в PATH локально."
+    exit 1
+fi
+
+if [[ -z "${SSHPASS_BIN}" ]]; then
+    log "ERROR" "sshpass не найден. Установите: apt-get install sshpass"
+    exit 1
+fi
+
+log "INFO" "Локальные бинарники: ssh=${SSH_BIN}, rsync=${RSYNC_BIN}, sshpass=${SSHPASS_BIN}"
+log "INFO" "Удалённый rsync путь: ${REMOTE_RSYNC_PATH}"
+
+# ---- Проверка файла с паролем ----
+if [[ ! -f "${PASS_FILE}" ]]; then
+    log "ERROR" "Файл с паролем не найден: ${PASS_FILE}"
+    exit 1
+fi
+
+PERMS=$(stat -c '%a' "${PASS_FILE}" 2>/dev/null || echo "???")
+if [[ "${PERMS}" != "600" && "${PERMS}" != "400" ]]; then
+    log "WARN" "Права на ${PASS_FILE} = ${PERMS}. Исправляем на 600."
+    if [[ $EUID -eq 0 ]]; then
+        chmod 600 "${PASS_FILE}"
+    fi
+fi
+
+# ---- SSH-опции ----
+SSH_OPTS="-p ${REMOTE_PORT} -o ConnectTimeout=${SSH_TIMEOUT} -o StrictHostKeyChecking=accept-new"
+
+# ---- Команда для rsync -e ----
+# Экранированные кавычки вокруг пути к паролю
+RSYNC_RSH_CMD="${SSHPASS_BIN} -f \"${PASS_FILE}\" ${SSH_BIN} ${SSH_OPTS}"
+
+# ============ СТАРТ ============
+log "INFO" "======================================================"
+log "INFO" "Запуск переноса с авторизацией по паролю"
+log "INFO" "Источник: ${SOURCE_DIRS[*]}"
+log "INFO" "Назначение: ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_BASE_DIR}"
+log "INFO" "======================================================"
+
+# Проверка соединения
+log "INFO" "Проверка соединения с ${REMOTE_HOST}..."
+if ! "${SSHPASS_BIN}" -f "${PASS_FILE}" "${SSH_BIN}" ${SSH_OPTS} \
+        "${REMOTE_USER}@${REMOTE_HOST}" "echo ok" &>>"${LOG_FILE}"; then
+    log "ERROR" "Не удалось подключиться к ${REMOTE_HOST}."
+    exit 1
+fi
+log "INFO" "Соединение установлено."
+
+# ============ НОВОЕ: Проверка rsync на удалённом хосте ============
+log "INFO" "Проверка наличия rsync на удалённом хосте..."
+REMOTE_RSYNC_CHECK=$("${SSHPASS_BIN}" -f "${PASS_FILE}" "${SSH_BIN}" ${SSH_OPTS} \
+    "${REMOTE_USER}@${REMOTE_HOST}" "which rsync 2>/dev/null || echo NOT_FOUND" 2>/dev/null)
+
+if [[ "${REMOTE_RSYNC_CHECK}" == "NOT_FOUND" || -z "${REMOTE_RSYNC_CHECK}" ]]; then
+    log "ERROR" "rsync НЕ НАЙДЕН на удалённом хосте ${REMOTE_HOST}!"
+    log "ERROR" "Установите rsync на удалённом хосте:"
+    log "ERROR" "  sudo apt-get install rsync  (Debian/Ubuntu)"
+    log "ERROR" "  sudo yum install rsync      (CentOS/RHEL)"
+    exit 1
+fi
+
+log "INFO" "rsync на удалённом хосте найден: ${REMOTE_RSYNC_CHECK}"
+
+# Если путь не совпадает с заданным — используем найденный
+if [[ "${REMOTE_RSYNC_CHECK}" != "${REMOTE_RSYNC_PATH}" ]]; then
+    log "WARN" "Путь к rsync отличается от заданного. Используем: ${REMOTE_RSYNC_CHECK}"
+    REMOTE_RSYNC_PATH="${REMOTE_RSYNC_CHECK}"
+fi
+
+# Создаём базовый каталог
+"${SSHPASS_BIN}" -f "${PASS_FILE}" "${SSH_BIN}" ${SSH_OPTS} \
+    "${REMOTE_USER}@${REMOTE_HOST}" "mkdir -p '${REMOTE_BASE_DIR}'" &>>"${LOG_FILE}" \
+    || { log "ERROR" "Не удалось создать ${REMOTE_BASE_DIR}"; exit 1; }
+
+# ============ ПЕРЕНОС ============
+TOTAL=0; SUCCESS=0; FAILED=0
+FAILED_DIRS=()
+
+for SRC in "${SOURCE_DIRS[@]}"; do
+    TOTAL=$((TOTAL + 1))
+
+    if [[ ! -d "${SRC}" ]]; then
+        log "WARN" "Источник не найден, пропуск: ${SRC}"
+        FAILED=$((FAILED + 1))
+        FAILED_DIRS+=("${SRC} (не существует)")
+        continue
+    fi
+
+    DEST="${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_BASE_DIR}/$(basename "${SRC}")"
+    log "INFO" "------------------------------------------------------"
+    log "INFO" "Перенос: ${SRC}  ->  ${DEST}"
+
+    RETRY=0; RC=1
+    while [[ ${RETRY} -lt ${MAX_RETRIES} && ${RC} -ne 0 ]]; do
+        RETRY=$((RETRY + 1))
+        log "INFO" "Попытка ${RETRY}/${MAX_RETRIES}..."
+
+        # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: --rsync-path указывает явный путь к rsync на удалённом хосте
+        "${RSYNC_BIN}" -avz --delete \
+            --numeric-ids \
+            --partial --progress --stats --human-readable \
+            --rsync-path="${REMOTE_RSYNC_PATH}" \
+            -e "${RSYNC_RSH_CMD}" \
+            "${SRC}" "${DEST}" &>>"${LOG_FILE}"
+        RC=$?
+
+        case ${RC} in
+            0)
+                log "INFO" "Успешно: ${SRC}"
+                SUCCESS=$((SUCCESS + 1))
+                ;;
+            127)
+                log "ERROR" "Код 127: команда не найдена на удалённом хосте."
+                log "ERROR" "Проверьте, что rsync установлен на ${REMOTE_HOST}"
+                log "ERROR" "Используемый путь: ${REMOTE_RSYNC_PATH}"
+                FAILED=$((FAILED + 1))
+                FAILED_DIRS+=("${SRC} (code 127)")
+                RC=0
+                break
+                ;;
+            *)
+                log "WARN" "Ошибка rsync (код ${RC}) для ${SRC}"
+                sleep 5
+                ;;
+        esac
+    done
+
+    if [[ ${RC} -ne 0 ]]; then
+        FAILED=$((FAILED + 1))
+        FAILED_DIRS+=("${SRC} (ошибка после ${MAX_RETRIES} попыток, код ${RC})")
+    fi
+done
+
+# ============ ИТОГИ ============
+log "INFO" "======================================================"
+log "INFO" "ИТОГИ: всего=${TOTAL}, успешно=${SUCCESS}, ошибок=${FAILED}"
+if [[ ${#FAILED_DIRS[@]} -gt 0 ]]; then
+    for D in "${FAILED_DIRS[@]}"; do
+        log "ERROR" "  - Не перенесено: ${D}"
+    done
+fi
+log "INFO" "Лог сохранён: ${LOG_FILE}"
+
+[[ ${FAILED} -eq 0 ]] && exit 0 || exit 2
+```
+
+## Что изменилось
+
+| Изменение | Описание |
+|-----------|----------|
+| **`REMOTE_RSYNC_PATH`** | Новая переменная с явным путём к rsync на удалённом хосте (`/usr/bin/rsync`) |
+| **`--rsync-path`** | Добавлен в вызов rsync — указывает, какой бинарник запускать на удалённой стороне |
+| **Проверка удалённого rsync** | Перед переносом скрипт проверяет наличие rsync на удалённом хосте через `which rsync` |
+| **Автоопределение пути** | Если `which rsync` находит другой путь — скрипт использует его |
+
+## Быстрое решение без изменения скрипта
+
+Если нужно срочно запустить перенос, можно просто добавить одну опцию в существующий вызов rsync:
+
+```bash
+--rsync-path="/usr/bin/rsync"
+```
+
+Или установить rsync на удалённом хосте:
+```bash
+ssh srvansible@nn-1cfls-001-p "sudo apt-get install -y rsync"
+```

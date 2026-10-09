@@ -546,3 +546,264 @@ rsync ... 2>&1 | sed -E 's/backupuser@[0-9.]+/backupuser@<host>/g' >> "${LOG_FIL
 ```bash
 chmod 700 /var/log/rsync_transfer
 ```
+
+_____
+_____
+
+
+Исправление ошибки «код 127»
+
+Код 127 в bash означает «command not found» — команда не найдена. Это не ошибка rsync (у него коды 0–35), а ошибка оболочки: rsync попытался запустить внешнюю команду из параметра -e, и не нашёл её.
+
+Где именно возникает 127 в моём скрипте
+
+Три типичные причины:
+
+1. sshpass или ssh не в PATH (особенно в cron)
+
+Когда скрипт запускается из cron или systemd, PATH=/usr/bin:/bin вместо обычного /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:.... Если sshpass лежит в /usr/local/bin или собран вручную — rsync его не найдёт и вернёт 127.
+
+2. -e со строкой, где путь содержит пробелы или относительный путь
+
+```bash
+SSHPASS_CMD="sshpass -f ${PASS_FILE}"    # ← если PASS_FILE=/path with space/pass
+-e "${SSHPASS_CMD} ssh ${SSH_OPTS}"      # ← rsync разобьёт по пробелам
+```
+
+rsync парсит -e по пробелам — путь с пробелом превратится в несуществующую команду → 127.
+
+3. stat -c на системах, где его нет в PATH (редко, но бывает в минимальных образах)
+
+---
+
+Исправленный скрипт
+
+Ключевые правки:
+
+· явное разрешение абсолютных путей через command -v;
+· нормализация PATH (важно для cron);
+· использование абсолютных путей в -e, чтобы rsync не зависел от PATH;
+· отдельная обработка кода 127 с понятным сообщением и выходом;
+· проверка не только sshpass, но и ssh.
+
+```bash
+#!/bin/bash
+#
+# rsync_transfer_pass.sh — перенос с авторизацией по паролю
+# Исправлена обработка кода 127 (command not found)
+#
+
+# ============ ГАРАНТИРОВАННЫЙ PATH ============
+# Если запускается из cron — PATH может быть урезан.
+# Добавляем стандартные каталоги, где обычно лежат ssh/sshpass.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
+
+# ============ НАСТРОЙКИ ============
+SOURCE_DIRS=(
+    "/data/app1/"
+    "/data/app2/"
+)
+
+REMOTE_USER="backupuser"
+REMOTE_HOST="192.168.1.100"
+REMOTE_PORT="22"
+REMOTE_BASE_DIR="/backup/data"
+
+PASS_FILE="/root/.rsync_pass"
+
+LOG_DIR="/var/log/rsync_transfer"
+LOG_FILE="${LOG_DIR}/rsync_$(date +%Y%m%d_%H%M%S).log"
+
+MAX_RETRIES=3
+SSH_TIMEOUT=30
+
+# ============ ПОДГОТОВКА ============
+mkdir -p "${LOG_DIR}"
+umask 077
+
+log() {
+    local level="$1"; shift
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [${level}] $*" | tee -a "${LOG_FILE}"
+}
+
+# ---- Разрешаем абсолютные пути к бинарникам ----
+# Это ключевое исправление: rsync получает уже готовые полные пути
+# и не зависит от PATH в момент вызова ssh.
+SSHPASS_BIN="$(command -v sshpass 2>/dev/null)"
+SSH_BIN="$(command -v ssh 2>/dev/null)"
+RSYNC_BIN="$(command -v rsync 2>/dev/null)"
+
+if [[ -z "${SSH_BIN}" ]]; then
+    log "ERROR" "ssh не найден в PATH. Установите openssh-client."
+    exit 1
+fi
+
+if [[ -z "${RSYNC_BIN}" ]]; then
+    log "ERROR" "rsync не найден в PATH."
+    exit 1
+fi
+
+if [[ -z "${SSHPASS_BIN}" ]]; then
+    log "ERROR" "sshpass не найден. Установите: apt-get install sshpass"
+    log "INFO"  "Пути поиска: ${PATH}"
+    exit 1
+fi
+
+log "INFO" "Используемые бинарники: ssh=${SSH_BIN}, rsync=${RSYNC_BIN}, sshpass=${SSHPASS_BIN}"
+
+# ---- Проверка файла с паролем ----
+if [[ ! -f "${PASS_FILE}" ]]; then
+    log "ERROR" "Файл с паролем не найден: ${PASS_FILE}"
+    exit 1
+fi
+
+PERMS=$(stat -c '%a' "${PASS_FILE}" 2>/dev/null || echo "???")
+if [[ "${PERMS}" != "600" && "${PERMS}" != "400" ]]; then
+    log "WARN" "Права на ${PASS_FILE} = ${PERMS}. Рекомендуется 600."
+fi
+
+# ---- Формируем SSH-опции с АБСОЛЮТНЫМ путём к ssh ----
+# Обратите внимание: заворачиваем в кавычки путь к ssh, если там пробелы.
+SSH_OPTS="-p ${REMOTE_PORT} -o ConnectTimeout=${SSH_TIMEOUT} -o StrictHostKeyChecking=accept-new"
+
+# Для sshpass: -f <file> <абсолютный_путь_ssh> <опции>
+SSHPASS_CMD="${SSHPASS_BIN} -f ${PASS_FILE} ${SSH_BIN} ${SSH_OPTS}"
+
+# ============ СТАРТ ============
+log "INFO" "======================================================"
+log "INFO" "Запуск переноса с авторизацией по паролю"
+log "INFO" "Источник: ${SOURCE_DIRS[*]}"
+log "INFO" "Назначение: ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_BASE_DIR}"
+log "INFO" "======================================================"
+
+# Проверка соединения
+log "INFO" "Проверка соединения с ${REMOTE_HOST}..."
+if ! ${SSHPASS_BIN} -f "${PASS_FILE}" "${SSH_BIN}" ${SSH_OPTS} \
+        "${REMOTE_USER}@${REMOTE_HOST}" "echo ok" &>>"${LOG_FILE}"; then
+    log "ERROR" "Не удалось подключиться к ${REMOTE_HOST}. Проверьте пароль."
+    exit 1
+fi
+log "INFO" "Соединение установлено."
+
+# Создаём базовый каталог
+${SSHPASS_BIN} -f "${PASS_FILE}" "${SSH_BIN}" ${SSH_OPTS} \
+    "${REMOTE_USER}@${REMOTE_HOST}" "mkdir -p '${REMOTE_BASE_DIR}'" &>>"${LOG_FILE}" \
+    || { log "ERROR" "Не удалось создать ${REMOTE_BASE_DIR}"; exit 1; }
+
+# ============ ПЕРЕНОС ============
+TOTAL=0; SUCCESS=0; FAILED=0
+FAILED_DIRS=()
+
+for SRC in "${SOURCE_DIRS[@]}"; do
+    TOTAL=$((TOTAL + 1))
+
+    if [[ ! -d "${SRC}" ]]; then
+        log "WARN" "Источник не найден, пропуск: ${SRC}"
+        FAILED=$((FAILED + 1))
+        FAILED_DIRS+=("${SRC} (не существует)")
+        continue
+    fi
+
+    DEST="${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_BASE_DIR}/$(basename "${SRC}")"
+    log "INFO" "------------------------------------------------------"
+    log "INFO" "Перенос: ${SRC}  ->  ${DEST}"
+
+    RETRY=0; RC=1
+    while [[ ${RETRY} -lt ${MAX_RETRIES} && ${RC} -ne 0 ]]; do
+        RETRY=$((RETRY + 1))
+        log "INFO" "Попытка ${RETRY}/${MAX_RETRIES}..."
+
+        # -e получает ГОТОВУЮ команду с абсолютными путями.
+        # rsync запускает её через shell → 127 не должно быть.
+        "${RSYNC_BIN}" -avz --delete \
+            --numeric-ids \
+            --partial --progress --stats --human-readable \
+            -e "${SSHPASS_CMD}" \
+            "${SRC}" "${DEST}" &>>"${LOG_FILE}"
+        RC=$?
+
+        case ${RC} in
+            0)
+                log "INFO" "Успешно: ${SRC}"
+                SUCCESS=$((SUCCESS + 1))
+                ;;
+            127)
+                # command not found — обычно sshpass/ssh не в PATH
+                log "ERROR" "Код 127: команда не найдена. Проверьте, что sshpass и ssh доступны."
+                log "ERROR" "PATH=${PATH}"
+                log "ERROR" "ssh=${SSH_BIN}, sshpass=${SSHPASS_BIN}, rsync=${RSYNC_BIN}"
+                # Повторять бессмысленно — 127 не исчезнет само
+                FAILED=$((FAILED + 1))
+                FAILED_DIRS+=("${SRC} (code 127)")
+                RC=0   # выходим из цикла повторов
+                break
+                ;;
+            *)
+                log "WARN" "Ошибка rsync (код ${RC}) для ${SRC}"
+                sleep 5
+                ;;
+        esac
+    done
+done
+
+# ============ ИТОГИ ============
+log "INFO" "======================================================"
+log "INFO" "ИТОГИ: всего=${TOTAL}, успешно=${SUCCESS}, ошибок=${FAILED}"
+for D in "${FAILED_DIRS[@]}"; do
+    log "ERROR" "  - Не перенесено: ${D}"
+done
+log "INFO" "Лог сохранён: ${LOG_FILE}"
+
+[[ ${FAILED} -eq 0 ]] && exit 0 || exit 2
+```
+
+---
+
+Что именно изменилось (и почему это лечит 127)
+
+Было Стало Зачем
+-e "sshpass -f ... ssh ..." (голые имена) -e "${SSHPASS_BIN} -f ${PASS_FILE} ${SSH_BIN} ..." (абсолютные пути) rsync не зависит от PATH в момент вызова
+Не трогал PATH export PATH="...стандартные пути...:${PATH}" чинит запуск из cron/systemd
+Не проверял ssh и rsync command -v ssh, command -v rsync падаем с понятным сообщением, а не с 127
+Код 127 попадал в общий *) и повторялся Отдельный case 127) → break не тратим 3 попытки на безнадёжную ошибку
+Не логировались пути бинарников Логируем ssh=…, sshpass=…, rsync=… мгновенно видно, если что-то не разрешилось
+
+---
+
+Быстрая диагностика, если 127 всё равно остался
+
+Выполните на сервере, где запускается скрипт:
+
+```bash
+# 1. Где бинарники?
+which sshpass; which ssh; which rsync
+#   должно вернуть: /usr/bin/sshpass, /usr/bin/ssh, /usr/bin/rsync (или /usr/local/...)
+
+# 2. Что видит cron? Добавьте в crontab временно:
+* * * * * echo "PATH=$PATH" >> /tmp/cron_path.log
+#   и посмотрите: обычно это /usr/bin:/bin — без /usr/local/bin
+
+# 3. Ручная проверка цепочки
+/usr/bin/sshpass -f /root/.rsync_pass /usr/bin/ssh -p 22 user@host echo ok
+
+# 4. Если sshpass установлен, но лежит нестандартно (например, /opt/bin)
+#    — просто добавьте его каталог в начало PATH в скрипте:
+export PATH="/opt/bin:${PATH}"
+```
+
+---
+
+Альтернатива без sshpass (если 127 связан именно с ним)
+
+Если sshpass в вашей системе в принципе отсутствует или запрещён политикой ИБ — используйте штатный механизм SSH через ssh-agent, тогда никаких внешних команд в -e не нужно и 127 исчезнет как класс:
+
+```bash
+# Один раз:
+ssh-keygen -t ed25519 -f /root/.ssh/id_rsa_rsync -N ''   # без passphrase — если политика позволяет
+ssh-copy-id -i /root/.ssh/id_rsa_rsync.pub user@host
+
+# В скрипте вместо sshpass:
+-e "ssh -i /root/.ssh/id_rsa_rsync -p ${REMOTE_PORT} -o ConnectTimeout=30"
+```
+
+Это, кстати, и правильнее с точки зрения безопасности — пароль пользователя на сервере вообще не участвует.

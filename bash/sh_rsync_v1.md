@@ -1230,29 +1230,7 @@ ________
 
 ## Распознанный вывод скрипта
 
-```
-[2026-10-09 17:17:21] [INFO] Используемые бинарники: ssh=/usr/bin/ssh, rsync=/usr/bin/rsync, sshpass=/...
-[2026-10-09 17:17:21] [INFO] ======================================================
-[2026-10-09 17:17:21] [INFO] Запуск переноса с авторизацией по паролю
-[2026-10-09 17:17:21] [INFO] Источник: /tmp/app01
-[2026-10-09 17:17:21] [INFO] Назначение: srvansible@nn-1cfls-001-p:/tmp/bk_app_all
-[2026-10-09 17:17:21] [INFO] ======================================================
-[2026-10-09 17:17:21] [INFO] Проверка соединения с nn-1cfls-001-p...
-ok
-[2026-10-09 17:17:22] [INFO] Соединение установлено.
-[2026-10-09 17:17:22] [INFO] ------------------------------------------------------
-[2026-10-09 17:17:22] [INFO] Перенос: /tmp/app01  ->  srvansible@nn-1cfls-001-p:/tmp/bk_app_all/app01
-[2026-10-09 17:17:22] [INFO] Попытка 1/3...
-bash: line 1: rsync: command not found
-rsync: connection unexpectedly closed (0 bytes received so far) [sender]
-rsync error: remote command not found (code 127) at io.c(232) [sender=3.2.7]
-[2026-10-09 17:17:23] [ERROR] Код 127: команда не найдена. Проверьте пути к sshpass/ssh.
-[2026-10-09 17:17:23] [ERROR] Сформированная команда RSH: /usr/bin/sshpass -f "/root/.rsync_pass" /usr/bin/ssh...
-[2026-10-09 17:17:23] [INFO] ======================================================
-[2026-10-09 17:17:23] [INFO] ИТОГИ: всего=1, успешно=0, ошибок=1
-[2026-10-09 17:17:23] [ERROR]   - Не перенесено: /tmp/app01 (code 127)
-[2026-10-09 17:17:23] [INFO] Лог сохранён: /var/log/rsync_transfer/rsync_20261009_171721.log
-```
+log
 
 ## Диагноз проблемы
 
@@ -1285,8 +1263,8 @@ SOURCE_DIRS=(
     "/tmp/app01"
 )
 
-REMOTE_USER="srvansible"
-REMOTE_HOST="nn-1cfls-001-p"
+REMOTE_USER="suser"
+REMOTE_HOST="serv001"
 REMOTE_PORT="22"
 REMOTE_BASE_DIR="/tmp/bk_app_all"
 

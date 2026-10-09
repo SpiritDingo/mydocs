@@ -221,3 +221,328 @@ rsync -navc --checksum ... | tee verify.log
 ```
 
 Шаги 3 и 4 и есть «проверка изменения при копировании» — они гарантируют, что всё, что менялось во время передачи, в итоге скопировано корректно.
+
+____
+____
+
+Авторизация по паролю для rsync
+
+У rsync нет собственного параметра пароля — он использует SSH. Значит, вариантов три:
+
+Способ Безопасность Удобство Когда использовать
+sshpass ⚠️ низкая (пароль в скрипте/окружении) высокое внутренняя сеть, автоматизация
+expect ⚠️ низкая среднее если sshpass недоступен
+SSH-ключ с паролем + ssh-agent ✅ высокая среднее рекомендуется
+
+Разберу все три, но сразу скажу: по-настоящему правильный способ — ключи (способ 3). Пароль в скрипте — компромисс, оправданный только в доверенной сети.
+
+---
+
+Вариант 1. sshpass (самый простой)
+
+Установка
+
+```bash
+# Debian/Ubuntu
+apt-get install -y sshpass
+
+# RHEL/CentOS/Fedora
+yum install -y sshpass
+# или
+dnf install -y sshpass
+```
+
+Безопасный способ передачи пароля (без аргумента -p)
+
+Аргумент -p виден в ps aux всем пользователям системы. Правильно — через переменную окружения или файл:
+
+```bash
+# Через переменную окружения (пароль не виден в ps)
+export SSHPASS='mypassword'
+rsync -avz -e "sshpass -e ssh -p 22 -o StrictHostKeyChecking=accept-new" \
+    /data/app1/ user@192.168.1.100:/backup/data/app1/
+
+# Или из файла (chmod 600)
+echo 'mypassword' > /root/.rsync_pass
+chmod 600 /root/.rsync_pass
+rsync -avz -e "sshpass -f /root/.rsync_pass ssh -p 22" \
+    /data/app1/ user@192.168.1.100:/backup/data/app1/
+```
+
+Обновлённый скрипт с паролем
+
+```bash
+#!/bin/bash
+#
+# rsync_transfer_pass.sh — перенос каталогов с авторизацией по паролю
+#
+
+# ============ НАСТРОЙКИ ============
+SOURCE_DIRS=(
+    "/data/app1/"
+    "/data/app2/"
+)
+
+REMOTE_USER="backupuser"
+REMOTE_HOST="192.168.1.100"
+REMOTE_PORT="22"
+REMOTE_BASE_DIR="/backup/data"
+
+# --- Авторизация ---
+# Вариант A: файл с паролем (рекомендуется, chmod 600)
+PASS_FILE="/root/.rsync_pass"
+# Вариант B: пароль в переменной (раскомментируйте, если файла нет)
+# RSYNC_PASSWORD="mypassword"
+
+LOG_DIR="/var/log/rsync_transfer"
+LOG_FILE="${LOG_DIR}/rsync_$(date +%Y%m%d_%H%M%S).log"
+
+MAX_RETRIES=3
+SSH_TIMEOUT=30
+
+# ============ ПОДГОТОВКА ============
+mkdir -p "${LOG_DIR}"
+umask 077   # чтобы лог не был доступен всем
+
+log() {
+    local level="$1"; shift
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [${level}] $*" | tee -a "${LOG_FILE}"
+}
+
+# Проверка наличия sshpass
+if ! command -v sshpass &>/dev/null; then
+    log "ERROR" "sshpass не установлен. Установите: apt-get install sshpass"
+    exit 1
+fi
+
+# Определяем, откуда брать пароль
+if [[ -f "${PASS_FILE}" ]]; then
+    # Проверяем права на файл
+    PERMS=$(stat -c '%a' "${PASS_FILE}")
+    if [[ "${PERMS}" != "600" && "${PERMS}" != "400" ]]; then
+        log "WARN" "Права на ${PASS_FILE} = ${PERMS}. Рекомендуется 600."
+    fi
+    SSHPASS_CMD="sshpass -f ${PASS_FILE}"
+    log "INFO" "Авторизация: пароль из файла ${PASS_FILE}"
+elif [[ -n "${RSYNC_PASSWORD}" ]]; then
+    export SSHPASS="${RSYNC_PASSWORD}"
+    SSHPASS_CMD="sshpass -e"
+    log "INFO" "Авторизация: пароль из переменной окружения"
+else
+    log "ERROR" "Не задан пароль (${PASS_FILE} не найден и RSYNC_PASSWORD пуст)"
+    exit 1
+fi
+
+# SSH-опции
+SSH_OPTS="-p ${REMOTE_PORT} -o ConnectTimeout=${SSH_TIMEOUT} -o StrictHostKeyChecking=accept-new"
+
+# ============ СТАРТ ============
+log "INFO" "======================================================"
+log "INFO" "Запуск переноса с авторизацией по паролю"
+log "INFO" "Источник: ${SOURCE_DIRS[*]}"
+log "INFO" "Назначение: ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_BASE_DIR}"
+log "INFO" "======================================================"
+
+# Проверка соединения (через sshpass)
+log "INFO" "Проверка соединения с ${REMOTE_HOST}..."
+if ! ${SSHPASS_CMD} ssh ${SSH_OPTS} "${REMOTE_USER}@${REMOTE_HOST}" "echo ok" &>>"${LOG_FILE}"; then
+    log "ERROR" "Не удалось подключиться к ${REMOTE_HOST}. Проверьте пароль."
+    exit 1
+fi
+log "INFO" "Соединение установлено."
+
+# Создаём базовый каталог
+${SSHPASS_CMD} ssh ${SSH_OPTS} "${REMOTE_USER}@${REMOTE_HOST}" \
+    "mkdir -p '${REMOTE_BASE_DIR}'" &>>"${LOG_FILE}" \
+    || { log "ERROR" "Не удалось создать ${REMOTE_BASE_DIR}"; exit 1; }
+
+# ============ ПЕРЕНОС ============
+TOTAL=0; SUCCESS=0; FAILED=0
+FAILED_DIRS=()
+
+for SRC in "${SOURCE_DIRS[@]}"; do
+    TOTAL=$((TOTAL + 1))
+
+    if [[ ! -d "${SRC}" ]]; then
+        log "WARN" "Источник не найден, пропуск: ${SRC}"
+        FAILED=$((FAILED + 1))
+        FAILED_DIRS+=("${SRC} (не существует)")
+        continue
+    fi
+
+    DEST="${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_BASE_DIR}/$(basename "${SRC}")"
+    log "INFO" "------------------------------------------------------"
+    log "INFO" "Перенос: ${SRC}  ->  ${DEST}"
+
+    RETRY=0; RC=1
+    while [[ ${RETRY} -lt ${MAX_RETRIES} && ${RC} -ne 0 ]]; do
+        RETRY=$((RETRY + 1))
+        log "INFO" "Попытка ${RETRY}/${MAX_RETRIES}..."
+
+        # ВАЖНО: sshpass оборачивает именно ssh, а не rsync
+        rsync -avz --delete \
+            --numeric-ids \
+            --partial --progress --stats --human-readable \
+            -e "${SSHPASS_CMD} ssh ${SSH_OPTS}" \
+            "${SRC}" "${DEST}" &>>"${LOG_FILE}"
+        RC=$?
+
+        if [[ ${RC} -eq 0 ]]; then
+            log "INFO" "Успешно: ${SRC}"
+            SUCCESS=$((SUCCESS + 1))
+        else
+            log "WARN" "Ошибка rsync (код ${RC}) для ${SRC}"
+            sleep 5
+        fi
+    done
+
+    if [[ ${RC} -ne 0 ]]; then
+        log "ERROR" "Не удалось перенести ${SRC} после ${MAX_RETRIES} попыток"
+        FAILED=$((FAILED + 1))
+        FAILED_DIRS+=("${SRC}")
+    fi
+done
+
+# ============ ИТОГИ ============
+log "INFO" "======================================================"
+log "INFO" "ИТОГИ: всего=${TOTAL}, успешно=${SUCCESS}, ошибок=${FAILED}"
+for D in "${FAILED_DIRS[@]}"; do
+    log "ERROR" "  - Не перенесено: ${D}"
+done
+log "INFO" "Лог сохранён: ${LOG_FILE}"
+
+[[ ${FAILED} -eq 0 ]] && exit 0 || exit 2
+```
+
+Настройка перед запуском
+
+```bash
+# Создаём файл с паролем
+echo 'mypassword' > /root/.rsync_pass
+chmod 600 /root/.rsync_pass
+
+# Запуск
+chmod +x rsync_transfer_pass.sh
+sudo ./rsync_transfer_pass.sh
+```
+
+Ключевой момент: sshpass оборачивает не rsync, а ssh:
+
+```bash
+-e "sshpass -f /root/.rsync_pass ssh -p 22 ..."
+```
+
+Если написать sshpass ... rsync, работать не будет — rsync запускает ssh сам.
+
+---
+
+Вариант 2. expect (если sshpass недоступен)
+
+```bash
+#!/usr/bin/expect -f
+# rsync_expect.exp
+
+set timeout 3600
+set password "mypassword"
+set src "/data/app1/"
+set dst "backupuser@192.168.1.100:/backup/data/app1/"
+
+spawn rsync -avz --partial -e "ssh -p 22 -o StrictHostKeyChecking=accept-new" $src $dst
+
+expect {
+    "password:" {
+        send "$password\r"
+        exp_continue
+    }
+    "Password:" {
+        send "$password\r"
+        exp_continue
+    }
+    "yes/no" {
+        send "yes\r"
+        exp_continue
+    }
+    eof
+}
+
+catch wait result
+exit [lindex $result 3]
+```
+
+Запуск:
+
+```bash
+chmod +x rsync_expect.exp
+./rsync_expect.exp | tee /var/log/rsync_transfer/rsync_$(date +%F).log
+```
+
+Минус: пароль в открытом виде в файле скрипта, плюс expect капризен с локалями.
+
+---
+
+Вариант 3. SSH-ключ с паролем + ssh-agent (рекомендуемый)
+
+Позволяет и пароль сохранить, и безопасность не терять: ключ на диске зашифрован, но в рамках сессии ssh-agent держит его расшифрованным.
+
+Разовая настройка
+
+```bash
+# 1. Создаём ключ С паролем (passphrase)
+ssh-keygen -t ed25519 -f /root/.ssh/id_rsa_rsync -C "rsync-backup"
+#   введёте passphrase — это и есть "пароль"
+
+# 2. Копируем публичный ключ на приёмник
+ssh-copy-id -i /root/.ssh/id_rsa_rsync.pub -p 22 backupuser@192.168.1.100
+#   здесь ОДИН РАЗ введёте пароль пользователя backupuser
+```
+
+Запуск скрипта (сессия ssh-agent)
+
+```bash
+# Запускаем агент и добавляем ключ (спросит passphrase 1 раз)
+eval "$(ssh-agent -s)"
+ssh-add /root/.ssh/id_rsa_rsync
+
+# Дальше rsync работает без пароля
+./rsync_transfer.sh
+```
+
+Автоматизация через keychain (для cron)
+
+```bash
+apt-get install -y keychain
+
+# В ~/.bashrc или в самом скрипте:
+eval "$(keychain --eval --agents ssh id_rsa_rsync)"
+```
+
+Теперь passphrase вводится один раз, а дальше ключ «живёт» в агенте для всех последующих запусков, включая cron (через ~/.keychain/$(hostname)-sh).
+
+---
+
+Сравнение и что выбрать
+
+Если сеть доверенная и хочется просто — берите sshpass + файл /root/.rsync_pass с правами 600. Минимум телодвижений, пароль не светится в ps.
+
+Если безопасность важна — только SSH-ключ с passphrase + ssh-agent/keychain. Пароль пользователя на сервере вообще не используется, ключ зашифрован, passphrase вводится человеком или хранится в защищённом агенте.
+
+Чего делать НЕ стоит:
+
+· sshpass -p 'пароль' — пароль виден в ps aux любому пользователю системы
+· хранить пароль в Git-репозитории, даже приватном
+· отключать StrictHostKeyChecking=no глобально в ~/.ssh/config — это открывает MITM-атаку
+
+Бонус: защита от утечки пароля через логи
+
+sshpass при ошибке аутентификации может написать в stderr что-то вроде Permission denied, please try again — сам пароль не светит, но имя пользователя попадёт в лог. Если беспокоит — добавьте в скрипт фильтр:
+
+```bash
+# Перенаправляем rsync в лог, но чистим потенциально чувствительные строки
+rsync ... 2>&1 | sed -E 's/backupuser@[0-9.]+/backupuser@<host>/g' >> "${LOG_FILE}"
+```
+
+И на всякий случай — не забудьте закрыть доступ к самому лог-каталогу:
+
+```bash
+chmod 700 /var/log/rsync_transfer
+```

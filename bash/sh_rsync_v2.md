@@ -1249,3 +1249,367 @@ tail -f /var/log/rsync_transfer/rsync_*.log
 ```
 
 Если по итогу владельцы на приёмнике совпадают с источником, а в логе нет code 23 и Permission denied — root-права настроены правильно.
+_____
+_____
+_____
+_____
+_____
+
+Локальный root + удалённый root в одном скрипте
+
+Разделим ответственность явно:
+
+Сторона Кто нужен Зачем
+Локально (источник) root читать файлы из закрытых каталогов (/var/lib/mysql/, ~/.ssh/, 600-файлы)
+Удалённо (приёмник) root сохранять владельцев/группы, писать в защищённые каталоги
+
+Локальный root даёт только чтение источника. Но одной этой половины мало: без root на приёмнике rsync не сможет применить chown/chmod, и файлы лягут под пользователем SSH-сессии. Поэтому в скрипте ниже — оба уровня сразу, с явным авто-повышением прав.
+
+---
+
+Ключевая идея: самоперезапуск через sudo
+
+Чтобы не забыть sudo ./script.sh, добавляем в начало паттерн re-exec:
+
+```bash
+if [[ ${EUID} -ne 0 ]]; then
+    exec sudo -- "$0" "$@"
+fi
+```
+
+Скрипт сам поднимется до root, сохранив аргументы. Это и есть «локальный root».
+
+---
+
+Полный скрипт: локальный root + удалённый root
+
+```bash
+#!/bin/bash
+#
+# rsync_transfer_root_both.sh
+# Локальный root (чтение источника) + удалённый root (запись приёмника)
+#
+
+# ============ ГАРАНТИРОВАННЫЙ PATH ============
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
+
+# ============================================================
+# ЧАСТЬ 1. ЛОКАЛЬНЫЙ ROOT — самоперезапуск через sudo
+# ============================================================
+if [[ ${EUID} -ne 0 ]]; then
+    if command -v sudo &>/dev/null; then
+        echo "[*] Повышение прав: перезапуск через sudo..."
+        exec sudo -- "$0" "$@"
+    else
+        echo "ОШИБКА: скрипт требует root, а sudo не установлен."
+        echo "Запустите от root: su -c '$0'"
+        exit 1
+    fi
+fi
+
+# Теперь мы точно root локально
+log_local_root() {
+    echo "[$(date '+%F %T')] [INFO] Локальный пользователь: $(id -un) (UID=${EUID})"
+}
+
+# ============ НАСТРОЙКИ ============
+SOURCE_DIRS=(
+    "/data/app1/"
+    "/data/app2/"
+    "/var/lib/mysql/"
+)
+
+REMOTE_USER="backupuser"
+REMOTE_HOST="192.168.1.100"
+REMOTE_PORT="22"
+REMOTE_BASE_DIR="/backup/data"
+PASS_FILE="/root/.rsync_pass"
+
+# Как получаем root на приёмнике:
+#   "user"  — SSH под REMOTE_USER + sudo rsync (рекомендуется)
+#   "root"  — SSH прямо под root@ (нужен PermitRootLogin)
+REMOTE_PRIV_MODE="user"
+REMOTE_ROOT_USER="root"
+REMOTE_SUDO="/usr/bin/sudo"
+
+LOG_DIR="/var/log/rsync_transfer"
+LOG_FILE="${LOG_DIR}/rsync_$(date +%Y%m%d_%H%M%S).log"
+MAX_RETRIES=3
+SSH_TIMEOUT=30
+
+mkdir -p "${LOG_DIR}"
+umask 077
+
+log() {
+    local level="$1"; shift
+    echo "[$(date '+%F %T')] [${level}] $*" | tee -a "${LOG_FILE}"
+}
+
+# ============ ПРОВЕРКА ЛОКАЛЬНОГО ROOT (ещё раз, для наглядности) ============
+if [[ ${EUID} -ne 0 ]]; then
+    log "ERROR" "Локальный root не получен. Выход."
+    exit 1
+fi
+log "INFO" "Локальный root: OK ($(id -un), UID=${EUID})"
+
+# ============ БИНАРНИКИ ============
+SSHPASS_BIN="$(command -v sshpass)"
+SSH_BIN="$(command -v ssh)"
+RSYNC_BIN="$(command -v rsync)"
+[[ -z "${SSHPASS_BIN}" ]] && { log "ERROR" "sshpass не найден"; exit 1; }
+[[ -z "${SSH_BIN}"     ]] && { log "ERROR" "ssh не найден";     exit 1; }
+[[ -z "${RSYNC_BIN}"   ]] && { log "ERROR" "rsync не найден";   exit 1; }
+log "INFO" "Бинарники: ssh=${SSH_BIN}, rsync=${RSYNC_BIN}, sshpass=${SSHPASS_BIN}"
+
+# ============ ПРОВЕРКА ЛОКАЛЬНОГО ДОСТУПА К ИСТОЧНИКАМ ============
+# Под root читаем первый байт первого файла каждого каталога —
+# если не читается, значит проблема с SELinux/ACL/immutable, а не с правами.
+log "INFO" "Проверка локального доступа к источникам..."
+for SRC in "${SOURCE_DIRS[@]}"; do
+    if [[ ! -d "${SRC}" ]]; then
+        log "WARN" "Источник отсутствует: ${SRC}"
+        continue
+    fi
+    FIRST_FILE=$(find "${SRC}" -type f -print -quit 2>/dev/null)
+    if [[ -n "${FIRST_FILE}" ]]; then
+        if ! dd if="${FIRST_FILE}" of=/dev/null bs=1 count=1 status=none 2>/dev/null; then
+            log "WARN" "Не читается даже root: ${FIRST_FILE} (SELinux/ACL/immutable?)"
+        else
+            log "INFO" "Чтение OK: ${FIRST_FILE}"
+        fi
+    fi
+done
+
+# ============ SSH-ОБЁРТКА ============
+[[ ! -f "${PASS_FILE}" ]] && { log "ERROR" "Нет файла пароля ${PASS_FILE}"; exit 1; }
+PERMS=$(stat -c '%a' "${PASS_FILE}")
+[[ "${PERMS}" != "600" && "${PERMS}" != "400" ]] && \
+    log "WARN" "Права ${PASS_FILE}=${PERMS}, рекомендуется 600."
+
+SSH_OPTS="-p ${REMOTE_PORT} -o ConnectTimeout=${SSH_TIMEOUT} -o StrictHostKeyChecking=accept-new"
+
+if [[ "${REMOTE_PRIV_MODE}" == "root" ]]; then
+    LOGIN_USER="${REMOTE_ROOT_USER}"
+    RSYNC_PATH_OPT=""
+    log "INFO" "Приёмник: root@ по SSH"
+else
+    LOGIN_USER="${REMOTE_USER}"
+    # Удалённый rsync запускается через sudo → сохранит владельцев
+    RSYNC_PATH_OPT="--rsync-path=${REMOTE_SUDO} ${RSYNC_BIN}"
+    log "INFO" "Приёмник: ${REMOTE_USER}@ + sudo rsync"
+fi
+DEST_LOGIN="${LOGIN_USER}@${REMOTE_HOST}"
+
+SSHPASS_SSH="${SSHPASS_BIN} -f ${PASS_FILE} ${SSH_BIN} ${SSH_OPTS}"
+run_remote() {
+    ${SSHPASS_BIN} -f "${PASS_FILE}" "${SSH_BIN}" ${SSH_OPTS} "${DEST_LOGIN}" "$@"
+}
+
+# ============ ПРОВЕРКА УДАЛЁННОГО ROOT ============
+log "INFO" "Проверка соединения с ${REMOTE_HOST}..."
+run_remote "echo ok" &>>"${LOG_FILE}" || { log "ERROR" "Нет связи"; exit 1; }
+
+if [[ "${REMOTE_PRIV_MODE}" == "user" ]]; then
+    log "INFO" "Проверка sudo на приёмнике..."
+    SUDO_UID=$(run_remote "${REMOTE_SUDO} -n id -u" 2>/dev/null)
+    if [[ "${SUDO_UID}" != "0" ]]; then
+        log "ERROR" "sudo на приёмнике не даёт root (UID='${SUDO_UID}')"
+        log "ERROR" "Добавьте NOPASSWD в /etc/sudoers.d/rsync-backup на приёмнике:"
+        log "ERROR" "  ${REMOTE_USER} ALL=(root) NOPASSWD: ${REMOTE_SUDO}, ${RSYNC_BIN}, /usr/bin/mkdir"
+        exit 1
+    fi
+    log "INFO" "Удалённый root через sudo: OK (UID=0)"
+else
+    RUID=$(run_remote "id -u" 2>/dev/null)
+    [[ "${RUID}" != "0" ]] && { log "ERROR" "SSH под root@, но UID=${RUID}"; exit 1; }
+    log "INFO" "Удалённый root напрямую: OK"
+fi
+
+# Создаём базовый каталог от root на приёмнике
+log "INFO" "Создание ${REMOTE_BASE_DIR} на приёмнике..."
+if [[ "${REMOTE_PRIV_MODE}" == "user" ]]; then
+    run_remote "${REMOTE_SUDO} -n mkdir -p '${REMOTE_BASE_DIR}'" &>>"${LOG_FILE}" \
+        || { log "ERROR" "Не удалось создать ${REMOTE_BASE_DIR}"; exit 1; }
+else
+    run_remote "mkdir -p '${REMOTE_BASE_DIR}'" &>>"${LOG_FILE}" \
+        || { log "ERROR" "Не удалось создать ${REMOTE_BASE_DIR}"; exit 1; }
+fi
+
+# ============ ПЕРЕНОС ============
+log "INFO" "======================================================"
+log "INFO" "Локальный root → чтение источника"
+log "INFO" "Удалённый root  → запись приёмника (владельцы/права)"
+log "INFO" "======================================================"
+
+TOTAL=0; SUCCESS=0; FAILED=0
+FAILED_DIRS=()
+
+for SRC in "${SOURCE_DIRS[@]}"; do
+    TOTAL=$((TOTAL + 1))
+    if [[ ! -d "${SRC}" ]]; then
+        log "WARN" "Пропуск (нет источника): ${SRC}"
+        FAILED=$((FAILED + 1)); FAILED_DIRS+=("${SRC} (нет)")
+        continue
+    fi
+
+    DEST="${DEST_LOGIN}:${REMOTE_BASE_DIR}/$(basename "${SRC}")"
+    log "INFO" "--- ${SRC}  ->  ${DEST}"
+
+    RETRY=0; RC=1
+    while [[ ${RETRY} -lt ${MAX_RETRIES} && ${RC} -ne 0 ]]; do
+        RETRY=$((RETRY + 1))
+        log "INFO" "Попытка ${RETRY}/${MAX_RETRIES}..."
+
+        # Здесь локальный root даёт чтение источника,
+        # а ${RSYNC_PATH_OPT} поднимает rsync на приёмнике до root,
+        # чтобы -aHAXS с --numeric-ids реально применились.
+        "${RSYNC_BIN}" -aHAXS \
+            --numeric-ids \
+            --devices --specials \
+            --super \
+            --partial --progress --stats --human-readable \
+            ${RSYNC_PATH_OPT} \
+            -e "${SSHPASS_SSH}" \
+            "${SRC}" "${DEST}" &>>"${LOG_FILE}"
+        RC=$?
+
+        case ${RC} in
+            0)
+                log "INFO" "Успешно: ${SRC}"; SUCCESS=$((SUCCESS + 1)) ;;
+            23)
+                log "WARN" "Частичный перенос (23) — проверьте лог (права/SELinux)"
+                SUCCESS=$((SUCCESS + 1)) ;;
+            127)
+                log "ERROR" "Код 127 — команда не найдена (sshpass/ssh/sudo)"
+                FAILED=$((FAILED + 1)); FAILED_DIRS+=("${SRC} (127)"); break ;;
+            *)
+                log "WARN" "Ошибка rsync (${RC}) для ${SRC}"; sleep 5 ;;
+        esac
+    done
+
+    [[ ${RC} -ne 0 && ${RC} -ne 23 ]] && { FAILED=$((FAILED + 1)); FAILED_DIRS+=("${SRC}"); }
+done
+
+# ============ ИТОГИ ============
+log "INFO" "======================================================"
+log "INFO" "ИТОГИ: всего=${TOTAL}, успешно=${SUCCESS}, ошибок=${FAILED}"
+for D in "${FAILED_DIRS[@]}"; do log "ERROR" "  - ${D}"; done
+log "INFO" "Лог: ${LOG_FILE}"
+log "INFO" "Проверка владельцев на приёмнике:"
+log "INFO" "  ssh ${LOGIN_USER}@${REMOTE_HOST} 'sudo find ${REMOTE_BASE_DIR} -printf \"%u:%g %m %p\\n\" | head'"
+
+[[ ${FAILED} -eq 0 ]] && exit 0 || exit 2
+```
+
+---
+
+Что именно даёт локальный root
+
+1. Авто-повышение прав
+
+```bash
+if [[ ${EUID} -ne 0 ]]; then
+    exec sudo -- "$0" "$@"
+fi
+```
+
+Запускаете как обычно — скрипт сам поднимется до root и сохранит все аргументы. Если sudo нет, подскажет su -c.
+
+2. Проверка чтения источника под root
+
+```bash
+dd if="${FIRST_FILE}" of=/dev/null bs=1 count=1
+```
+
+Это отсекает случай «файл виден, но не читается» — например, SELinux-контекст или chattr +i. Без этой проверки rsync потом выдаст permission denied уже в процессе.
+
+3. Флаги rsync, работающие только под root
+
+Флаг Что делает
+-a Рекурсия + права + времена + владельцы + группы + симлинки
+-H Жёсткие ссылки
+-A POSIX ACL
+-X xattr (расширенные атрибуты)
+-S Разреженные (sparse) файлы
+--devices --specials Устройства и FIFO/socket
+--numeric-ids UID/GID не маппятся через пользователя SSH
+--super Даже если получатель не root — попытаться применить root-атрибуты
+
+Без локального root rsync тихо «просеет» все файлы с 0600 и 0700 чужих пользователей, а без удалённого root — не сможет их корректно разместить с нужными владельцами.
+
+---
+
+Настройка приёмника (обязательный шаг)
+
+На 192.168.1.100 под root:
+
+```bash
+# Пользователь для SSH
+useradd -m -s /bin/bash backupuser
+
+# Разрешаем ему ТОЛЬКО rsync/mkdir/id от root без пароля
+cat >/etc/sudoers.d/rsync-backup <<'EOF'
+backupuser ALL=(root) NOPASSWD: /usr/bin/rsync, /usr/bin/mkdir, /usr/bin/id, /usr/bin/find
+EOF
+chmod 440 /etc/sudoers.d/rsync-backup
+visudo -c    # проверка синтаксиса
+```
+
+Ключевая строка в скрипте:
+
+```bash
+RSYNC_PATH_OPT="--rsync-path=/usr/bin/sudo /usr/bin/rsync"
+```
+
+Именно она превращает rsync на приёмнике в root, даже когда SSH-сессия открыта под backupuser.
+
+---
+
+Проверка, что оба root сработали
+
+```bash
+# На источнике — от root:
+find /var/lib/mysql -printf '%u:%g %m %p\n' | sort > /tmp/src_own.txt
+
+# На приёмнике — через sudo:
+ssh backupuser@192.168.1.100 \
+    "sudo find /backup/data/mysql -printf '%u:%g %m %p\n' | sort" > /tmp/dst_own.txt
+
+diff /tmp/src_own.txt /tmp/dst_own.txt && echo "OK: владельцы/права идентичны"
+```
+
+Ожидаемые признаки проблем:
+
+Симптом Причина
+Владельцы на приёмнике = backupuser:backupuser вместо mysql:mysql --rsync-path=sudo rsync не применился
+В логе permission denied (13) на источник Локальный root не получен (или SELinux/ACL)
+sudo: a password is required Нет NOPASSWD в sudoers на приёмнике
+Много code 23 Проблема с правами с одной из сторон
+code 127 sshpass/ssh/sudo не найдены в PATH
+
+---
+
+Как это запускается на практике
+
+```bash
+# 1. Один раз: файл с SSH-паролем
+echo 'ssh-pass-backupuser' > /root/.rsync_pass
+chmod 600 /root/.rsync_pass
+
+# 2. Один раз на приёмнике: sudoers NOPASSWD
+
+# 3. Запуск — просто от своего пользователя, скрипт сам поднимется до root
+./rsync_transfer_root_both.sh
+
+# Или явно:
+sudo ./rsync_transfer_root_both.sh
+```
+
+Скрипт сам:
+
+1. Проверит EUID, при необходимости перезапустится через sudo;
+2. Убедится, что локально читает источники под root;
+3. Проверит, что на приёмнике sudo rsync реально даёт UID=0;
+4. Запустит rsync с полным набором root-флагов (-aHAXS --numeric-ids --super).
+
+В итоге получаете точную копию источника — с владельцами, правами, ACL, xattr и hardlink-ами, а не «файлы под backupuser с урезанными правами», как при обычном запуске без root.

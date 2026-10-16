@@ -881,3 +881,371 @@ log "INFO" "======================================================"
 - `>d........` - новая директория создана
 - Первая буква: `f` = файл, `d` = директория
 - Вторая буква: `.` = без изменений, буква = тип изменения
+
+______
+______
+______
+______
+______
+
+
+Добавление root-прав в скрипт rsync
+
+rsync должен запускаться от root, чтобы:
+
+· читать файлы, недоступные обычному пользователю (например, /var/lib/mysql/, /etc/, чужие ~/.ssh/);
+· сохранять владельцев/группы (--numeric-ids работает только под root);
+· сохранять права, включая SUID/SGID-биты;
+· сохранять device-файлы, симлинки с владельцами;
+· создавать каталоги в защищённых местах.
+
+Если запустить под обычным пользователем — rsync тихо «съест» часть файлов (выдаст Permission denied в лог) и на приёмнике будут неверные владельцы. Ниже — исправленный скрипт с проверкой root и правильной работой на обеих сторонах.
+
+---
+
+Что важно понимать про «root на двух сторонах»
+
+Что На источнике (откуда) На приёмнике (куда)
+Читать все файлы нужен root —
+Сохранять владельцев (-a) нужен root нужен root
+Создавать файлы в защищённых каталогах — нужен root
+Создавать device/спецфайлы (-D) нужен root нужен root
+
+Значит root нужен на обеих машинах. Это делается одним из двух способов:
+
+1. root@ по SSH на приёмник (обычно запрещён политикой — PermitRootLogin no);
+2. обычный пользователь на приёмнике, но с sudo rsync — и --rsync-path="sudo rsync".
+
+В скрипте реализую оба варианта с переключателем.
+
+---
+
+Исправленный скрипт с root-правами
+
+```bash
+#!/bin/bash
+#
+# rsync_transfer_root.sh — перенос данных с root-правами
+# Запускать ТОЛЬКО от root (или через sudo).
+#
+
+# ============ ГАРАНТИРОВАННЫЙ PATH ============
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
+
+# ============ НАСТРОЙКИ ============
+SOURCE_DIRS=(
+    "/data/app1/"
+    "/data/app2/"
+    "/var/lib/mysql/"
+)
+
+REMOTE_USER="backupuser"
+REMOTE_HOST="192.168.1.100"
+REMOTE_PORT="22"
+REMOTE_BASE_DIR="/backup/data"
+PASS_FILE="/root/.rsync_pass"
+
+# --- Способ получения root на приёмнике ---
+# "user"  — подключаемся как REMOTE_USER, но rsync запускаем через sudo
+# "root"  — подключаемся как root@ (требует PermitRootLogin yes)
+REMOTE_PRIV_MODE="user"
+
+# Если REMOTE_PRIV_MODE="root" — под каким пользователем идём по SSH:
+REMOTE_ROOT_USER="root"
+
+# Путь к sudo на приёмнике (обычно /usr/bin/sudo)
+REMOTE_SUDO="/usr/bin/sudo"
+
+# ============ ЛОГИ ============
+LOG_DIR="/var/log/rsync_transfer"
+LOG_FILE="${LOG_DIR}/rsync_$(date +%Y%m%d_%H%M%S).log"
+
+MAX_RETRIES=3
+SSH_TIMEOUT=30
+
+# ============ ПРОВЕРКА ROOT ============
+if [[ ${EUID} -ne 0 ]]; then
+    echo "ОШИБКА: скрипт должен запускаться от root (или через sudo)."
+    echo "Текущий UID: ${EUID}"
+    echo "Запустите: sudo $0"
+    exit 1
+fi
+
+mkdir -p "${LOG_DIR}"
+umask 077
+
+log() {
+    local level="$1"; shift
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [${level}] $*" | tee -a "${LOG_FILE}"
+}
+
+# ============ ПРОВЕРКА БИНАРНИКОВ ============
+SSHPASS_BIN="$(command -v sshpass 2>/dev/null)"
+SSH_BIN="$(command -v ssh 2>/dev/null)"
+RSYNC_BIN="$(command -v rsync 2>/dev/null)"
+
+[[ -z "${SSH_BIN}"   ]] && { echo "ssh не найден";     exit 1; }
+[[ -z "${RSYNC_BIN}" ]] && { echo "rsync не найден";   exit 1; }
+[[ -z "${SSHPASS_BIN}" ]] && { echo "sshpass не найден"; exit 1; }
+
+log "INFO" "Запуск от: $(id -un) (UID=${EUID})"
+log "INFO" "Бинарники: ssh=${SSH_BIN} rsync=${RSYNC_BIN} sshpass=${SSHPASS_BIN}"
+
+# ============ ФОРМИРУЕМ SSH-КОМАНДУ ============
+[[ ! -f "${PASS_FILE}" ]] && { log "ERROR" "Нет файла пароля ${PASS_FILE}"; exit 1; }
+
+PERMS=$(stat -c '%a' "${PASS_FILE}" 2>/dev/null || echo "???")
+[[ "${PERMS}" != "600" && "${PERMS}" != "400" ]] && \
+    log "WARN" "Права на ${PASS_FILE}=${PERMS}, рекомендуется 600."
+
+SSH_OPTS="-p ${REMOTE_PORT} -o ConnectTimeout=${SSH_TIMEOUT} -o StrictHostKeyChecking=accept-new"
+
+# Куда подключаемся по SSH
+if [[ "${REMOTE_PRIV_MODE}" == "root" ]]; then
+    LOGIN_USER="${REMOTE_ROOT_USER}"
+    RSYNC_PATH_OPT=""                       # root и так root
+    log "INFO" "Режим: root@ по SSH"
+else
+    LOGIN_USER="${REMOTE_USER}"
+    # На приёмнике rsync запускается через sudo
+    RSYNC_PATH_OPT="--rsync-path=${REMOTE_SUDO} ${RSYNC_BIN}"
+    log "INFO" "Режим: ${REMOTE_USER}@ + sudo rsync на приёмнике"
+fi
+
+DEST_LOGIN="${LOGIN_USER}@${REMOTE_HOST}"
+
+# sshpass-обёртка вокруг ssh (абсолютные пути!)
+SSHPASS_SSH="${SSHPASS_BIN} -f ${PASS_FILE} ${SSH_BIN} ${SSH_OPTS}"
+# sshpass-обёртка для прямых ssh-команд (проверка соединения, mkdir)
+run_remote() { ${SSHPASS_BIN} -f "${PASS_FILE}" "${SSH_BIN}" ${SSH_OPTS} "${DEST_LOGIN}" "$@"; }
+
+# ============ СТАРТ ============
+log "INFO" "======================================================"
+log "INFO" "Перенос с root-правами"
+log "INFO" "Источник: ${SOURCE_DIRS[*]}"
+log "INFO" "Назначение: ${DEST_LOGIN}:${REMOTE_BASE_DIR}"
+log "INFO" "======================================================"
+
+# --- Проверка соединения ---
+log "INFO" "Проверка соединения..."
+if ! run_remote "echo ok" &>>"${LOG_FILE}"; then
+    log "ERROR" "Не удалось подключиться к ${REMOTE_HOST}"
+    exit 1
+fi
+log "INFO" "Соединение установлено."
+
+# --- Проверка sudo на приёмнике (если режим user) ---
+if [[ "${REMOTE_PRIV_MODE}" == "user" ]]; then
+    log "INFO" "Проверка sudo на приёмнике..."
+    if ! run_remote "${REMOTE_SUDO} -n id -u" &>>"${LOG_FILE}"; then
+        log "ERROR" "sudo на приёмнике требует пароль или запрещён."
+        log "ERROR" "Настройте NOPASSWD для rsync или используйте REMOTE_PRIV_MODE=root"
+        exit 1
+    fi
+    SUDO_UID=$(run_remote "${REMOTE_SUDO} -n id -u" 2>/dev/null)
+    if [[ "${SUDO_UID}" != "0" ]]; then
+        log "ERROR" "sudo на приёмнике не даёт root (UID=${SUDO_UID})"
+        exit 1
+    fi
+    log "INFO" "sudo на приёмнике работает, UID=0"
+fi
+
+# --- Создаём базовый каталог (тоже от root!) ---
+log "INFO" "Создание ${REMOTE_BASE_DIR} на приёмнике..."
+if [[ "${REMOTE_PRIV_MODE}" == "user" ]]; then
+    run_remote "${REMOTE_SUDO} -n mkdir -p '${REMOTE_BASE_DIR}'" &>>"${LOG_FILE}" \
+        || { log "ERROR" "Не удалось создать ${REMOTE_BASE_DIR}"; exit 1; }
+else
+    run_remote "mkdir -p '${REMOTE_BASE_DIR}'" &>>"${LOG_FILE}" \
+        || { log "ERROR" "Не удалось создать ${REMOTE_BASE_DIR}"; exit 1; }
+fi
+
+# ============ ПЕРЕНОС ============
+TOTAL=0; SUCCESS=0; FAILED=0
+FAILED_DIRS=()
+
+for SRC in "${SOURCE_DIRS[@]}"; do
+    TOTAL=$((TOTAL + 1))
+
+    if [[ ! -d "${SRC}" ]]; then
+        log "WARN" "Источник не найден: ${SRC}"
+        FAILED=$((FAILED + 1))
+        FAILED_DIRS+=("${SRC} (не существует)")
+        continue
+    fi
+
+    # Проверяем читаемость источника под root
+    if ! head -c 1 "$(find "${SRC}" -type f -print -quit 2>/dev/null)" &>/dev/null; then
+        log "WARN" "Некоторые файлы в ${SRC} могут быть нечитаемы даже root (SELinux/ACL?)"
+    fi
+
+    DEST="${DEST_LOGIN}:${REMOTE_BASE_DIR}/$(basename "${SRC}")"
+    log "INFO" "------------------------------------------------------"
+    log "INFO" "Перенос: ${SRC}  ->  ${DEST}"
+
+    RETRY=0; RC=1
+    while [[ ${RETRY} -lt ${MAX_RETRIES} && ${RC} -ne 0 ]]; do
+        RETRY=$((RETRY + 1))
+        log "INFO" "Попытка ${RETRY}/${MAX_RETRIES}..."
+
+        # Ключевые для root опции:
+        #   -a  — рекурсия, права, времена, симлинки, владельцы, группы, устройства
+        #   -H  — сохранять жёсткие ссылки
+        #   -A  — сохранять ACL
+        #   -X  — сохранять расширенные атрибуты (xattr)
+        #   --numeric-ids — не маппить UID/GID (обязательно при root-копировании)
+        #   -S  — разряженные файлы
+        #   -D  — устройства и спецфайлы (эквивалент --devices --specials)
+        #   --super         — попытаться применить root-атрибуты на приёмнике
+        #   --perms         — явно выставлять права
+        "${RSYNC_BIN}" -aHAXS \
+            --numeric-ids \
+            --devices --specials \
+            --super \
+            --partial --progress --stats --human-readable \
+            --delete \
+            ${RSYNC_PATH_OPT:+${RSYNC_PATH_OPT}} \
+            -e "${SSHPASS_SSH}" \
+            "${SRC}" "${DEST}" &>>"${LOG_FILE}"
+        RC=$?
+
+        case ${RC} in
+            0)
+                log "INFO" "Успешно: ${SRC}"
+                SUCCESS=$((SUCCESS + 1))
+                ;;
+            23)
+                # 23 = partial transfer (некоторые файлы пропущены — часто из-за прав)
+                log "WARN" "Частичный перенос (код 23). Проверьте права/SELinux в логе."
+                SUCCESS=$((SUCCESS + 1))   # считаем успешным, но с замечанием
+                ;;
+            127)
+                log "ERROR" "Код 127: команда не найдена (sshpass/ssh/sudo)."
+                FAILED=$((FAILED + 1)); FAILED_DIRS+=("${SRC} (127)"); break
+                ;;
+            *)
+                log "WARN" "Ошибка rsync (код ${RC}) для ${SRC}"
+                sleep 5
+                ;;
+        esac
+    done
+
+    if [[ ${RC} -ne 0 && ${RC} -ne 23 ]]; then
+        FAILED=$((FAILED + 1))
+        FAILED_DIRS+=("${SRC}")
+    fi
+done
+
+# ============ ИТОГИ ============
+log "INFO" "======================================================"
+log "INFO" "ИТОГИ: всего=${TOTAL}, успешно=${SUCCESS}, ошибок=${FAILED}"
+for D in "${FAILED_DIRS[@]}"; do
+    log "ERROR" "  - Не перенесено: ${D}"
+done
+log "INFO" "Лог: ${LOG_FILE}"
+
+[[ ${FAILED} -eq 0 ]] && exit 0 || exit 2
+```
+
+---
+
+Настройка приёмника (одна из двух схем)
+
+Схема A — SSH-логин под обычным пользователем + sudo rsync (рекомендуется)
+
+На приёмнике (192.168.1.100) создаём пользователя backupuser и даём ему право запускать только rsync и служебные команды от root без пароля:
+
+```bash
+# На приёмнике от root:
+useradd -m -s /bin/bash backupuser
+mkdir -p /root/.ssh && chmod 700 /root/.ssh
+
+# Разрешить backupuser запускать rsync/mkdir/id от root без пароля
+cat >/etc/sudoers.d/rsync-backup <<'EOF'
+backupuser ALL=(root) NOPASSWD: /usr/bin/rsync, /usr/bin/mkdir, /usr/bin/id
+EOF
+chmod 440 /etc/sudoers.d/rsync-backup
+```
+
+Ключевой флаг в скрипте: --rsync-path="sudo rsync" — rsync на приёмной стороне запускается как root, хотя SSH-сессия открыта под backupuser. Именно так работают почти все бэкапы в проде.
+
+Схема B — прямой SSH под root
+
+На приёмнике в /etc/ssh/sshd_config:
+
+```
+PermitRootLogin prohibit-password     # только по ключу, пароль запрещён
+```
+
+Плюс в скрипте поставьте REMOTE_PRIV_MODE="root". Менее безопасно, но проще.
+
+---
+
+Что именно в скрипте обеспечивает root-доступ
+
+Место Что делает
+if [[ ${EUID} -ne 0 ]] в начале Скрипт падает сразу, если запущен не от root
+--rsync-path="sudo rsync" rsync на приёмнике стартует под root, сохраняя владельцев
+-aHAXS -a + ACL (-A) + xattr (-X) + sparse (-S) + hardlinks (-H)
+--numeric-ids UID/GID передаются как есть, не маппятся на пользователя SSH-сессии
+--devices --specials Переносятся device-ноды и FIFO/socket-файлы
+--super rsync пытается применить root-атрибуты, даже если получатель не root
+--delete Удаление на приёмнике — осторожно! требует root там же
+Проверка sudo -n id -u Убеждаемся, что sudo реально даёт UID 0 и не просит пароль
+
+---
+
+Проверка, что root-права реально применились
+
+После копирования сравните владельцев на источнике и приёмнике:
+
+```bash
+# На источнике:
+find /var/lib/mysql -printf '%u:%g %m %p\n' | sort > /tmp/src_own.txt
+
+# На приёмнике:
+ssh backupuser@192.168.1.100 "sudo find /backup/data/mysql -printf '%u:%g %m %p\n' | sort" > /tmp/dst_own.txt
+
+diff /tmp/src_own.txt /tmp/dst_own.txt && echo "OK: владельцы и права идентичны"
+```
+
+Если всё совпало — значит root-права на обеих сторонах сработали. Если в диффе куча backupuser:backupuser вместо mysql:mysql — значит --rsync-path="sudo rsync" не применился (или sudo требует пароль и тихо упал).
+
+---
+
+Частые ошибки при root-копировании
+
+1. Запустили под sudo, но SSH идёт под непривилегированного пользователя.
+Локальный root ≠ удалённый root. Без --rsync-path="sudo rsync" на приёмнике файлы лягут под backupuser.
+
+2. sudo на приёмнике требует пароль.
+sudo -n провалится молча. Обязателен NOPASSWD в sudoers.
+
+3. SELinux на приёмнике (RHEL/CentOS/Fedora).
+Даже root не сможет создать файл, если контекст запрещает. Либо setenforce 0 на время, либо переносите контексты: добавьте -X (уже есть) и --numeric-ids. В тяжёлых случаях — restorecon -R на приёмнике после копирования.
+
+4. NFS/CIFS на приёмнике.
+Владельцы не сохранятся, если ФС не поддерживает chown или смонтирована с no_root_squash. Проверьте mount | grep /backup/data.
+
+5. --delete под root — это опасно вдвойне.
+Root удалит файлы, которые обычный пользователь не смог бы. Всегда сначала прогоняйте с --dry-run --delete, смотрите лог, и только потом без -n.
+
+---
+
+Минимальный безопасный запуск
+
+```bash
+# 1. Файл с паролем
+echo 'ssh-password-of-backupuser' > /root/.rsync_pass
+chmod 600 /root/.rsync_pass
+
+# 2. На приёмнике — sudoers NOPASSWD (см. схему A)
+
+# 3. Пробный прогон с dry-run (добавьте -n в rsync вручную)
+sudo ./rsync_transfer_root.sh
+
+# 4. Проверка лога
+tail -f /var/log/rsync_transfer/rsync_*.log
+```
+
+Если по итогу владельцы на приёмнике совпадают с источником, а в логе нет code 23 и Permission denied — root-права настроены правильно.
